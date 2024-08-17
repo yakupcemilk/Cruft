@@ -1,0 +1,6 @@
+flex mathematics.l
+bison -d mathematics.y
+
+gcc mathematics.tab.c lex.yy.c -o parser -lfl
+
+./parser < test_file.txt

@@ -1,0 +1,11 @@
+package mathematics
+
+pub fn add(y: i32, z: i32): i32
+    ret (y + z)
+
+pub fn arithmetic(a: i32, b: i32, x: i32): i32
+    const x: i32 = add(a, b)
+    ret x
+
+if (x > 0)
+    print(x)
