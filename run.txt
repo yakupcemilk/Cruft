@@ -1,5 +1,6 @@
 flex mathematics.l
 bison -d mathematics.y
+qbe mathematics.qbe | gcc -x assembler -o mathematics -
 
 gcc mathematics.tab.c lex.yy.c -o parser -lfl
 
