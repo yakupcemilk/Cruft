@@ -29,12 +29,13 @@ pub fn walk(directions: array, npcID: i32): void
     npcID: i32 = Math.random(100)
       
     pri fn direct(directions: array, speed: i32): void
-        const speed: i32 = 0.5
+        const speed: f16 = 0.5
         TO_FORWARD = while(W_PUSHED == true) { x + speed }
         TO_BACK= while(S_PUSHED == true) { x + speed * -1 }
         TO_LEFT = while(A_PUSHED == true) { y + speed }
         TO_RIGHT = while(D_PUSHED == true) { y + speed * -1 }
-    ret direct(): void
+    
+    direct(directions, 0.5)
 ```
 
 Backend provided by QBE, frontend provided by flex/bison
