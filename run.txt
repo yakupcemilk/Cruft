@@ -1,7 +1,7 @@
-flex mathematics.l
-bison -d mathematics.y
-qbe mathematics.qbe | gcc -x assembler -o mathematics -
+flex cruft.l
+bison -d cruft.y
+qbe cruft.qbe | gcc -x assembler -o cruft -
 
-gcc mathematics.tab.c lex.yy.c -o parser -lfl
+gcc cruft.tab.c lex.yy.c -o parser -lfl
 
-./parser < test_file.txt
+./parser < src/test.txt
