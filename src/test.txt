@@ -12,12 +12,12 @@ pub fn add(y: i32, z: i32): i32
 end
 
 pub fn arithmetic(a: i32, b: i32, x: i32): i32
-    const x: i32 = add(a, b)
-    ret x
+    x: i32 = add(a, b)
+    ret x: i32
 end 
 
-if (x > 0)
+if (x: i32 > 0)
     print(x)
-else (x < 0)
+else (x: i32 < 0)
     print('x is smol')
 end

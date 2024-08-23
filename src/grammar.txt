@@ -1,0 +1,36 @@
+array: (string | num) = [
+    {var1: name1, var2: name2},
+    {var3: name3, var4: name4}
+]
+
+array: (string) = [
+    {var1: name1, var2: name2},
+    {var3: name3, var4: name4}
+]
+
+array:
+    IDENTIFIER COLON LEFT_PARENT array_type_list RIGHT_PARENT EQU LEFT_ARR_PARENT array_part RIGHT_ARR_PARENT
+    | OTHER
+    ;
+
+array_part:
+    LEFT_ARR_ELT_PARENT array_list RIGHT_ARR_ELT_PARENT
+    | LEFT_ARR_ELT_PARENT array_list RIGHT_ARR_ELT_PARENT COMMA array_part
+    | OTHER
+    ;
+
+array_list:
+    array_element
+    | array_list COMMA array_element
+    | OTHER
+    ;
+
+array_element:
+    IDENTIFIER COLON IDENTIFIER
+    | OTHER
+    ;
+
+array_type_list:
+    type_list
+    | array_type_list UNION type_list
+    ;

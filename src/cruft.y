@@ -14,7 +14,7 @@ int yylex(void);
 
 %token <str> IDENTIFIER
 %token <ival> NUM
-%token PACK PUB PRI FUNC RETURN END IF ELSE SWI CASE PRINT CONST VAR MUT I_64 I_32 I_16 I_8 F_64 F_32 F_16 F_8 NULL LEFT_PARENT RIGHT_PARENT LEFT_ARR_PARENT RIGHT_ARR_PARENT COLON COMMA EQU SUB ADD MUL DIV BAD COMMENT NUM IDENTIFIER OTHER
+%token PACK SECURE TO EXPORT PUB PRI FUNC RETURN END IF ELSE SWI CASE PRINT CONST VAR MUT STRING ARRAY NUM BOOL TRUE FALSE ANY VOID OBJECT I_64 I_32 I_16 I_8 F_64 F_32 F_16 F_8 NULL LEFT_PARENT RIGHT_PARENT LEFT_ARR_PARENT RIGHT_ARR_PARENT COLON COMMA EQU SUB ADD MUL DIV BAD COMMENT NUM IDENTIFIER OTHER UNION SMOL SMOL_OR_EQU BIG BIG_OR_EQU AND OR XOR NOT NAND NOR XNOR IMPLIES IFF
 %type  <ival> expression
 
 %%
@@ -24,7 +24,8 @@ program:
     ;
 
 package_declaration:
-    | PACK IDENTIFIER { printf("Package: %s\n", $2); }
+    | PACK IDENTIFIER
+    | SECURE PACK IDENTIFIER
     ;
 
 include_type:
@@ -69,6 +70,19 @@ arithmetic_statements:
     | OTHER
     ;
 
+logical_expressions:
+    IDENTIFIER AND IDENTIFIER       { $$ = $1 && $3; }
+    | IDENTIFIER OR IDENTIFIER      { $$ = $1 || $3; }
+    | IDENTIFIER XOR IDENTIFIER     { $$ = ($1 || $3) && !($1 && $3); }
+    | NOT IDENTIFIER                { $$ = !$2; }
+    | IDENTIFIER NAND IDENTIFIER    { $$ = !($1 && $3); }
+    | IDENTIFIER NOR IDENTIFIER     { $$ = !($1 || $3); }
+    | IDENTIFIER XNOR IDENTIFIER    { $$ = !($1 || $3) || ($1 && $3); }
+    | IDENTIFIER IMPLIES IDENTIFIER { $$ = !$1 || $3; }
+    | IDENTIFIER IFF IDENTIFIER     { $$ = $1 == $3; }
+    | OTHER
+    ;
+
 function_list:
     function_declaration
     | function_list function_declaration
@@ -87,6 +101,12 @@ security:
 type_list:
     i_list
     | f_list
+    | bool_list
+    | STRING
+    | NUM
+    | ANY
+    | VOID
+    | OBJECT
     | OTHER
     ;
 
@@ -103,6 +123,12 @@ f_list:
     | F_32
     | F_16
     | F_8
+    | OTHER
+    ;
+
+bool_list:
+    TRUE
+    | FALSE
     | OTHER
     ;
 
@@ -167,18 +193,58 @@ elsebility:
     ;
 
 switch_statement:
-    SWI LEFT_PARENT notability case RIGHT_PARENT statement_list
+    SWI LEFT_PARENT case_list RIGHT_PARENT statement_list
     ;
 
 case:
     IDENTIFIER
+    | notability IDENTIFIER
+    | IDENTIFIER smol_big NUM
+    | IDENTIFIER smol_big IDENTIFIER
     | OTHER
     ;
 
 case_list
     case
-    | case_list case
+    | case_list COMMA case
     | OTHER
+    ;
+
+smol_big:
+    SMOL
+    | BIG
+    ;
+
+export:
+    | EXPORT package_declaration TO IDENTIFIER
+    | OTHER
+    ;
+
+array:
+    IDENTIFIER COLON LEFT_PARENT array_type_list RIGHT_PARENT EQU LEFT_ARR_PARENT array_part RIGHT_ARR_PARENT
+    | OTHER
+    ;
+
+array_part:
+    LEFT_ARR_ELT_PARENT array_list RIGHT_ARR_ELT_PARENT
+    | LEFT_ARR_ELT_PARENT array_list RIGHT_ARR_ELT_PARENT COMMA array_part
+    | OTHER
+    ;
+
+array_list:
+    LEFT_ARR_ELT_PARENT array_element RIGHT_ARR_ELT_PARENT
+    | array_list COMMA array_element
+    | OTHER
+    ;
+
+array_element:
+    IDENTIFIER COLON IDENTIFIER
+    | OTHER
+    ;
+
+array_type_list:
+    type_list
+    | array_type_list UNION type_list
     ;
 %%
 

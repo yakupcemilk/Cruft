@@ -1,5 +1,5 @@
 %{
-#include "mathematics.tab.h"
+#include "cruft.tab.h"
 #include <stdlib.h>
 #include <string.h>
 void showError();
@@ -13,6 +13,7 @@ whitespace       [ \t\n]+
 "package"        { return (PACK); }
 "secure"         { return (SEC); }
 "to"             { return (TO); }
+"export"         { return (EXPORT); }
 "import"         { return (IMPORT); }
 "use"            { return (USE); }
 "pub"            { return (PUB); }
@@ -28,6 +29,15 @@ whitespace       [ \t\n]+
 "const"          { return (CONST); }
 "var"            { return (VAR); }
 "mut"            { return (MUT); }
+"string"         { return (STRING); }
+"array"          { return (ARRAY); }
+"num"            { return (NUM); }
+"bool"           { return (BOOL); }
+"true"           { return (TRUE); }
+"false"          { return (FALSE); }
+"any"            { return (ANY); }
+"void"           { return (VOID); }
+"object"         { return (OBJECT); }
 "i64"            { return (I_64); }
 "i32"            { return (I_32); }
 "i16"            { return (I_16); }
@@ -41,6 +51,8 @@ whitespace       [ \t\n]+
 ")"              { return (RIGHT_PARENT); }
 "["              { return (LEFT_ARR_PARENT); }
 "]"              { return (RIGHT_ARR_PARENT); }
+"{"              { return (LEFT_ARR_ELT_PARENT); }
+"}"              { return (RIGHT_ARR_ELT_PARENT); }
 ":"              { return (COLON); }
 ","              { return (COMMA); }
 "="              { return (EQU); }
@@ -48,8 +60,22 @@ whitespace       [ \t\n]+
 "+"              { return (ADD); }
 "*"              { return (MUL); }
 "/"              { return (DIV); }
+"<"              { return (SMOL); }
+"=<"             { return (SMOL_OR_EQU); }
+">"              { return (BIG); }
+">="             { return (BIG_OR_EQU); }
 "!"              { return (BAD); }
+"|"              { return (UNION); }
 "//"             { return (COMMENT); }
+"and"            { return (AND); }
+"or"             { return (OR); }
+"xor"            { return (XOR); }
+"not"            { return (NOT); }
+"nand"           { return (NAND); }
+"nor"            { return (NOR); }
+"xnor"           { return (XNOR); }
+"implies"        { return (IMPLIES); }
+"iff"            { return (IFF); }
 {numbers}        { yylval.numbers = atoi(yytext); return (NUM);}
 {strings}        { sscanf(yytext, "%s", yylval.str); return (IDENTIFIER); }
 {whitespace}     { /* Ignore whitespace */ }
