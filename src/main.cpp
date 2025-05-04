@@ -2,7 +2,7 @@
 #include <fstream>
 #include <sstream>
 
-//#include "lexer/Lexer.h"
+#include "lexer/Lexer.h"
 #include "lexer/Token.h"
 
 int main(int argc, char** argv) {

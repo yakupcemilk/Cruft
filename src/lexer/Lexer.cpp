@@ -1,83 +1,126 @@
-#include "Lexer.h"  // Dosyanın en başında yer almalı
+// src/lexer/Lexer.cpp
+#include "Lexer.h"
+#include <unordered_set>
 
-Lexer::Lexer(const std::string& input) : input(input), index(0), line(1), column(0) {}
-
-Token Lexer::nextToken() {
-    skipWhitespace();
-    if (index >= input.size()) {
-        return Token(TokenType::EndOfFile, "", line, column);
-    }
-
-    char current = currentChar();
-    
-    if (std::isalpha(current)) {
-        return generateKeywordOrIdentifier();
-    }
-    if (std::isdigit(current)) {
-        return generateInteger();
-    }
-    if (current == '+') {
-        return generateOperator();
-    }
-    // Diğer token tiplerine göre işlemler burada yapılabilir.
-    
-    return Token(TokenType::Invalid, "", line, column); 
+// Yardımcı: bir string’in anahtar kelime olup olmadığını kontrol eder
+static bool isKeyword(const std::string& s) {
+    static const std::unordered_set<std::string> keywords = {
+        "package", "var", "const"
+    };
+    return keywords.count(s) > 0;
 }
 
-char Lexer::currentChar() {
+Lexer::Lexer(const std::string& input)
+    : input(input), index(0), line(1), column(1) {}
+
+char Lexer::currentChar() const {
+    if (index >= input.size()) return '\0';
     return input[index];
 }
 
 void Lexer::advance() {
+    if (currentChar() == '\n') {
+        line++;
+        column = 1;
+    } else {
+        column++;
+    }
     index++;
-    column++;
 }
 
 void Lexer::skipWhitespace() {
-    while (index < input.size() && std::isspace(input[index])) {
-        if (input[index] == '\n') {
-            line++;
-            column = 0;
-        }
+    while (std::isspace(currentChar())) {
         advance();
     }
 }
 
 void Lexer::skipComment() {
-    // Yorumları geçmek için işlem yapılacak
+    // “//” ile başlayan satır sonuna kadar atla
+    if (currentChar() == '/' && input[index+1] == '/') {
+        while (currentChar() != '\0' && currentChar() != '\n') {
+            advance();
+        }
+    }
 }
 
 Token Lexer::generateKeywordOrIdentifier() {
-    // Anahtar kelime veya identifier üretme işlemi yapılacak
-    return Token(TokenType::Identifier, "example", line, column);
+    size_t startCol = column;
+    std::string value;
+    // Harf veya alt çizgi ile başlar, sonra alfanümerik veya alt çizgi
+    while (std::isalnum(currentChar()) || currentChar() == '_') {
+        value.push_back(currentChar());
+        advance();
+    }
+    TokenType type = isKeyword(value) ? TokenType::Keyword : TokenType::Identifier;
+    return Token(type, value, line, startCol);
 }
 
 Token Lexer::generateInteger() {
-    // Integer token'ı üretme işlemi yapılacak
-    return Token(TokenType::Integer, "123", line, column);
+    size_t startCol = column;
+    std::string value;
+    while (std::isdigit(currentChar())) {
+        value.push_back(currentChar());
+        advance();
+    }
+    return Token(TokenType::Integer, value, line, startCol);
 }
 
 Token Lexer::generateOperator() {
-    // Operator token'ı üretme işlemi yapılacak
-    return Token(TokenType::Operator, "+", line, column);
+    size_t startCol = column;
+    char c = currentChar();
+    std::string op(1, c);
+    // Basit: + - * / = 
+    advance();
+    return Token(TokenType::Operator, op, line, startCol);
 }
 
 Token Lexer::generatePunctuation() {
-    // Punctuation token'ı üretme işlemi yapılacak
-    return Token(TokenType::Punctuation, ".", line, column);
+    size_t startCol = column;
+    char c = currentChar();
+    std::string p(1, c);
+    // Basit: : ; , ( ) { } 
+    advance();
+    return Token(TokenType::Punctuation, p, line, startCol);
 }
 
-Token Lexer::generateType() {
-    // Type token'ı üretme işlemi yapılacak
-    return Token(TokenType::Type, "int", line, column);
-}
-
-std::vector<Token> Lexer::tokenize() {
-    std::vector<Token> tokens;
-    Token tok = nextToken();
-    while (tok.type != TokenType::EndOfFile) {
-        tokens.push_back(tok);
-        tok = nextToken();
+Token Lexer::nextToken() {
+    // EOF kontrolü
+    if (index >= input.size()) {
+        return Token(TokenType::EndOfFile, "", line, column);
     }
-    return tokens;
+
+    // Whitespace ve yorumları atla
+    skipWhitespace();
+    skipComment();
+    skipWhitespace();
+
+    // Tekrar EOF kontrolü (comment sonrası)
+    if (index >= input.size()) {
+        return Token(TokenType::EndOfFile, "", line, column);
+    }
+
+    char c = currentChar();
+
+    // Harf veya '_' → identifier/keyword
+    if (std::isalpha(c) || c == '_') {
+        return generateKeywordOrIdentifier();
+    }
+    // Rakam → integer
+    if (std::isdigit(c)) {
+        return generateInteger();
+    }
+    // Operatör
+    if (c=='+'||c=='-'||c=='*'||c=='/'||c=='=') {
+        return generateOperator();
+    }
+    // Noktalama
+    if (c==':'||c==';'||c==','||c=='('||c==')'||c=='{'||c=='}') {
+        return generatePunctuation();
+    }
+
+    // Tanınmayan karakteri at ve Invalid token dön
+    size_t startCol = column;
+    std::string bad(1, c);
+    advance();
+    return Token(TokenType::Invalid, bad, line, startCol);
 }
