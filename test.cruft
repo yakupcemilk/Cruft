@@ -1,0 +1,3 @@
+package test
+var x: i32
+const y: i32
