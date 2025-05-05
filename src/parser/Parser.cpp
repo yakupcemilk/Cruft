@@ -41,16 +41,19 @@ std::shared_ptr<Statement> Parser::parseStatement() {
 std::shared_ptr<Statement> Parser::parseIfStatement() {
     advance();  // 'if' keyword'ünü geç
     auto expr = parseExpression();  // 'if' koşulunu al
-    auto statement = std::make_unique<IfStatement>(std::move(expr));
-    // Kod bloğu, else, elseif gibi kısımlar burada işlenebilir
+    // completion: provide empty then- and else-branch vectors to match the constructor signature
+    auto statement = std::make_unique<IfStatement>(
+        std::move(expr),
+        std::vector<std::shared_ptr<Statement>>{}, 
+        std::vector<std::shared_ptr<Statement>>{});
     return statement;
 }
 
 std::shared_ptr<Statement> Parser::parseWhileStatement() {
     advance();  // 'while' keyword'ünü geç
     auto expr = parseExpression();  // 'while' koşulunu al
-    auto statement = std::make_unique<WhileStatement>(std::move(expr));
-    // Döngü bloğu burada işlenebilir
+    // completion: pass an empty body vector to match the constructor signature
+    auto statement = std::make_unique<WhileStatement>(std::move(expr), std::vector<std::shared_ptr<Statement>>{});
     return statement;
 }
 
@@ -60,8 +63,34 @@ std::shared_ptr<Statement> Parser::parseReturnStatement() {
     return std::make_shared<ReturnStatement>(std::move(expr));
 }
 
+std::shared_ptr<Expr> Parser::parsePrimaryExpression() {
+    // handle parenthesized sub‐expressions
+    if (currentToken().type == TokenType::Punctuation && currentToken().value == "(") {
+        advance();  // consume '('
+        auto expr = parseExpression();
+        if (currentToken().type != TokenType::Punctuation || currentToken().value != ")")
+            throw std::runtime_error("Expected ')' after sub-expression");
+        advance();  // consume ')'
+        return expr;
+    }
+    // identifier or integer
+    if (currentToken().type == TokenType::Identifier || currentToken().type == TokenType::Integer) {
+        return parseVariableOrLiteral();
+    }
+    throw std::runtime_error("Unexpected token in expression");
+}
+
 std::shared_ptr<Statement> Parser::parsePrintStatement() {
+    advance(); // consume 'print'
+    // expect '('
+    if (currentToken().type != TokenType::Punctuation || currentToken().value != "(")
+        throw std::runtime_error("Expected '(' after 'print'");
+    advance(); // consume '('
     auto expr = parseExpression();
+    // expect ')'
+    if (currentToken().type != TokenType::Punctuation || currentToken().value != ")")
+        throw std::runtime_error("Expected ')' after print argument");
+    advance(); // consume ')'
     return std::make_shared<PrintStatement>(std::move(expr));
 }
 
@@ -72,22 +101,13 @@ std::shared_ptr<Expr> Parser::parseExpression() {
 std::shared_ptr<Expr> Parser::parseBinaryExpression(int precedence) {
     auto left = parsePrimaryExpression();  // İlk terimi (operand) al
     while (getPrecedence(currentToken()) > precedence) {
-        auto op = currentToken().value;  // Operatör
-        advance();  // Operatörü geç
-        auto right = parsePrimaryExpression();  // Sağ terimi al
-        left = std::make_unique<BinaryExpr>(std::move(left), op, std::move(right));
-    }
+            // Capture the full Token, not just its string value
+            Token opToken = currentToken();
+            advance();  // skip operator
+            auto right = parsePrimaryExpression();
+            left = std::make_unique<BinaryExpr>(std::move(left), opToken, std::move(right));
+        }
     return left;
-}
-
-std::shared_ptr<Expr> Parser::parsePrimaryExpression() {
-    if (currentToken().type == TokenType::Identifier) {
-        return parseVariableOrLiteral();  // Değişken veya literal bir değer
-    }
-    if (currentToken().type == TokenType::Integer) {
-        return parseVariableOrLiteral();  // Tam sayı literal
-    }
-    throw std::runtime_error("Unexpected token in expression");
 }
 
 std::shared_ptr<Expr> Parser::parseVariableOrLiteral() {
@@ -110,4 +130,19 @@ int Parser::getPrecedence(const Token& token) {
         if (token.value == "*" || token.value == "/") return 2;
     }
     return 0;  // En düşük öncelik
+}
+std::shared_ptr<Program> Parser::parseProgram() {
+    auto prog = std::make_shared<Program>();
+    // expect 'package' Identifier
+    if (currentToken().value == "package") {
+        advance();
+        prog->packageName = currentToken().value;
+        advance();
+    }
+    while (currentToken().type != TokenType::EndOfFile) {
+        auto stmt = parseStatement();
+        if (stmt) prog->statements.push_back(stmt);
+        else advance();  // skip unrecognized
+    }
+    return prog;
 }

@@ -1,3 +1,9 @@
 package test
+
 var x: i32
 const y: i32
+
+pub fn main(x: i32, y: i32): i32
+    z: i32 = x + y
+    print(z)
+end

@@ -1,17 +1,18 @@
 #pragma once
+
 #include "Statement.h"
-#include "Expr.h"
+#include "../stm/Expr.h"
 #include <memory>
+#include <vector>
 
 class IfStatement : public Statement {
 public:
-    explicit IfStatement(std::shared_ptr<Expr> condition)
-        : condition(std::move(condition)) {}
-
-    int getId() const override { 
-        return 1; 
-    } //FIXME bi ara inşallah buraya id vereceğim ya da sabit bir değer döndüreceğim
-
-private:
     std::shared_ptr<Expr> condition;
+    std::vector<std::shared_ptr<Statement>> thenBranch;
+    std::vector<std::shared_ptr<Statement>> elseBranch;
+
+    IfStatement(std::shared_ptr<Expr> cond,
+                std::vector<std::shared_ptr<Statement>> thenStmts,
+                std::vector<std::shared_ptr<Statement>> elseStmts)
+        : condition(cond), thenBranch(thenStmts), elseBranch(elseStmts) {}
 };
