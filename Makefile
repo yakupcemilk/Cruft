@@ -7,7 +7,7 @@
 CXX = g++
 
 # define any compile-time flags
-CXXFLAGS	:= -std=c++23 -Wall -Wextra -g
+CXXFLAGS	:= -std=c++23 -Wall -Wextra -g -Iinclude
 
 # define library paths in addition to /usr/lib
 #   if I wanted to include libraries not in /usr/lib I'd specify
