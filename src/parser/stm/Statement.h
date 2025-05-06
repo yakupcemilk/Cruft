@@ -1,6 +1,8 @@
 #pragma once
 
-class Statement {
-public:
-    virtual ~Statement() = default;
-};
+namespace cruft {
+    class Statement {
+        public:
+            virtual ~Statement() = default;
+        };
+}

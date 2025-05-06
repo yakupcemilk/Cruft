@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Statement.h"
-#include "../stm/Expr.h"
+#include "IntegerExpr.h"
 #include <string>
 #include <memory>
 

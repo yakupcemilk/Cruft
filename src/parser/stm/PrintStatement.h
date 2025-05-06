@@ -4,10 +4,12 @@
 #include "../stm/Expr.h"
 #include <memory>
 
-class PrintStatement : public Statement {
-public:
-    std::shared_ptr<Expr> expression;
-
-    PrintStatement(std::shared_ptr<Expr> expr)
-        : expression(expr) {}
-};
+namespace cruft {
+    class PrintStatement : public Statement {
+    public:
+        std::shared_ptr<Expr> expression;
+    
+        PrintStatement(std::shared_ptr<Expr> expr)
+            : expression(expr) {}
+    };
+}

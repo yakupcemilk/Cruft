@@ -1,6 +1,8 @@
 #pragma once
 
-class Expr {
-public:
-    virtual ~Expr() = default;
-};
+namespace cruft {
+    class Expr {
+    public:
+        virtual ~Expr() = default;
+    };
+}

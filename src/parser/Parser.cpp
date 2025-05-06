@@ -1,148 +1,162 @@
 #include "Parser.h"
+#include "../lexer/Token.h"
 #include "stm/IfStatement.h"
 #include "stm/WhileStatement.h"
 #include "stm/ReturnStatement.h"
 #include "stm/PrintStatement.h"
+#include "stm/VarDeclStatement.h"
+#include "stm/AssignmentStatement.h"
+#include "stm/FunctionDecl.h"
 
-Token Parser::currentToken() {
+#include <stdexcept>
+
+using namespace cruft;
+
+Token Parser::currentToken() const {
     return tokens[index];
 }
 
-void Parser::advance() {
-    if (index < tokens.size()) {
-        index++;
-    }
+Token Parser::currentToken() {
+    return static_cast<const Parser&>(*this).currentToken();
 }
 
-std::shared_ptr<Statement> Parser::parse() {
-    return parseStatement();
+void Parser::advance() {
+    if (index + 1 < tokens.size()) {
+        ++index;
+    }
 }
 
 std::shared_ptr<Statement> Parser::parseStatement() {
     if (currentToken().type == TokenType::Keyword) {
-        if (currentToken().value == "if") {
-            return parseIfStatement();
-        }
-        if (currentToken().value == "while") {
-            return parseWhileStatement();
-        }
-        if (currentToken().value == "ret") {
-            return parseReturnStatement();
-        }
-        if (currentToken().value == "print") {
-            return parsePrintStatement();
-        }
+        if (currentToken().value == "if")    return parseIfStatement();
+        if (currentToken().value == "while") return parseWhileStatement();
+        if (currentToken().value == "ret")   return parseReturnStatement();
+        if (currentToken().value == "print") return parsePrintStatement();
+        if (currentToken().value == "var")   return parseVarDecl();
+        if (currentToken().value == "fn")    return parseFunctionDecl();
     }
-    
-    // Diğer komutlar için işlem yapılacak
+    if (currentToken().type == TokenType::Identifier &&
+        peekToken().type == TokenType::Operator &&
+        peekToken().value == "=")
+    {
+        return parseAssignment();
+    }
     return nullptr;
 }
 
 std::shared_ptr<Statement> Parser::parseIfStatement() {
-    advance();  // 'if' keyword'ünü geç
-    auto expr = parseExpression();  // 'if' koşulunu al
-    // completion: provide empty then- and else-branch vectors to match the constructor signature
-    auto statement = std::make_unique<IfStatement>(
-        std::move(expr),
-        std::vector<std::shared_ptr<Statement>>{}, 
-        std::vector<std::shared_ptr<Statement>>{});
-    return statement;
+    advance();
+    auto cond = parseExpression();
+    // TODO: parse then/else blocks properly
+    return std::make_shared<IfStatement>(
+        std::move(cond),
+        std::vector<std::shared_ptr<Statement>>{},
+        std::vector<std::shared_ptr<Statement>>{}
+    );
 }
 
 std::shared_ptr<Statement> Parser::parseWhileStatement() {
-    advance();  // 'while' keyword'ünü geç
-    auto expr = parseExpression();  // 'while' koşulunu al
-    // completion: pass an empty body vector to match the constructor signature
-    auto statement = std::make_unique<WhileStatement>(std::move(expr), std::vector<std::shared_ptr<Statement>>{});
-    return statement;
+    advance();
+    auto cond = parseExpression();
+    // TODO: parse body properly
+    return std::make_shared<WhileStatement>(
+        std::move(cond),
+        std::vector<std::shared_ptr<Statement>>{}
+    );
 }
 
 std::shared_ptr<Statement> Parser::parseReturnStatement() {
+    advance(); 
     auto expr = parseExpression();
-    // hatalı: std::make_unique<RetStatement>
     return std::make_shared<ReturnStatement>(std::move(expr));
 }
 
-std::shared_ptr<Expr> Parser::parsePrimaryExpression() {
-    // handle parenthesized sub‐expressions
-    if (currentToken().type == TokenType::Punctuation && currentToken().value == "(") {
-        advance();  // consume '('
-        auto expr = parseExpression();
-        if (currentToken().type != TokenType::Punctuation || currentToken().value != ")")
-            throw std::runtime_error("Expected ')' after sub-expression");
-        advance();  // consume ')'
-        return expr;
-    }
-    // identifier or integer
-    if (currentToken().type == TokenType::Identifier || currentToken().type == TokenType::Integer) {
-        return parseVariableOrLiteral();
-    }
-    throw std::runtime_error("Unexpected token in expression");
-}
-
 std::shared_ptr<Statement> Parser::parsePrintStatement() {
-    advance(); // consume 'print'
-    // expect '('
+    advance(); 
     if (currentToken().type != TokenType::Punctuation || currentToken().value != "(")
         throw std::runtime_error("Expected '(' after 'print'");
-    advance(); // consume '('
+    advance(); 
     auto expr = parseExpression();
-    // expect ')'
     if (currentToken().type != TokenType::Punctuation || currentToken().value != ")")
         throw std::runtime_error("Expected ')' after print argument");
-    advance(); // consume ')'
+    advance(); 
     return std::make_shared<PrintStatement>(std::move(expr));
 }
 
-std::shared_ptr<Expr> Parser::parseExpression() {
-    return parseBinaryExpression(0);  // Başlangıçta düşük bir öncelik seviyesi
+std::shared_ptr<Statement> Parser::parseVarDecl() {
+    advance(); 
+    if (currentToken().type != TokenType::Identifier)
+        throw std::runtime_error("Expected identifier in var declaration");
+    std::string name = currentToken().value;
+    advance(); 
+
+    if (currentToken().type != TokenType::Punctuation || currentToken().value != ":")
+        throw std::runtime_error("Expected ':' after var name");
+    advance(); 
+
+    if (currentToken().type != TokenType::Identifier)
+        throw std::runtime_error("Expected type after ':' in var declaration");
+    advance(); 
+
+    std::shared_ptr<Expr> init = nullptr;
+    if (currentToken().type == TokenType::Operator && currentToken().value == "=") {
+        advance(); 
+        init = parseExpression();
+    }
+    return std::make_shared<VarDeclStatement>(name, std::move(init));
 }
 
-std::shared_ptr<Expr> Parser::parseBinaryExpression(int precedence) {
-    auto left = parsePrimaryExpression();  // İlk terimi (operand) al
-    while (getPrecedence(currentToken()) > precedence) {
-            // Capture the full Token, not just its string value
-            Token opToken = currentToken();
-            advance();  // skip operator
-            auto right = parsePrimaryExpression();
-            left = std::make_unique<BinaryExpr>(std::move(left), opToken, std::move(right));
+std::shared_ptr<Statement> Parser::parseAssignment() {
+    std::string name = currentToken().value;
+    advance(); 
+
+    if (currentToken().type != TokenType::Operator || currentToken().value != "=")
+        throw std::runtime_error("Expected '=' in assignment");
+    advance(); 
+
+    auto val = parseExpression();
+    return std::make_shared<AssignmentStatement>(name, std::move(val));
+}
+
+std::shared_ptr<Statement> Parser::parseFunctionDecl() {
+    advance(); 
+    if (currentToken().type != TokenType::Identifier)
+        throw std::runtime_error("Expected function name after 'fn'");
+    std::string name = currentToken().value;
+    advance(); 
+
+    std::vector<std::string> params;
+    if (currentToken().type == TokenType::Punctuation && currentToken().value == "(") {
+        advance(); 
+        while (!(currentToken().type == TokenType::Punctuation && currentToken().value == ")")) {
+            if (currentToken().type == TokenType::Identifier) {
+                params.push_back(currentToken().value);
+                advance();
+            }
+            if (currentToken().type == TokenType::Punctuation && currentToken().value == ",")
+                advance();
         }
-    return left;
-}
+        advance(); 
+    }
 
-std::shared_ptr<Expr> Parser::parseVariableOrLiteral() {
-    if (currentToken().type == TokenType::Identifier) {
-        auto var = std::make_unique<VariableExpr>(currentToken().value);
+    if (currentToken().type == TokenType::Punctuation && currentToken().value == ":") {
         advance();
-        return var;
+        if (currentToken().type == TokenType::Identifier) advance();
     }
-    if (currentToken().type == TokenType::Integer) {
-        auto integer = std::make_unique<IntegerExpr>(std::stoi(currentToken().value));
-        advance();
-        return integer;
-    }
-    throw std::runtime_error("Expected identifier or integer");
-}
 
-int Parser::getPrecedence(const Token& token) {
-    if (token.type == TokenType::Operator) {
-        if (token.value == "+" || token.value == "-") return 1;
-        if (token.value == "*" || token.value == "/") return 2;
-    }
-    return 0;  // En düşük öncelik
-}
-std::shared_ptr<Program> Parser::parseProgram() {
-    auto prog = std::make_shared<Program>();
-    // expect 'package' Identifier
-    if (currentToken().value == "package") {
-        advance();
-        prog->packageName = currentToken().value;
-        advance();
-    }
-    while (currentToken().type != TokenType::EndOfFile) {
+    std::vector<std::shared_ptr<Statement>> body;
+    while (!(currentToken().type == TokenType::Keyword && currentToken().value == "end")) {
         auto stmt = parseStatement();
-        if (stmt) prog->statements.push_back(stmt);
-        else advance();  // skip unrecognized
+        if (stmt) body.push_back(stmt);
+        else advance();
     }
-    return prog;
+    advance(); 
+
+    return std::make_shared<FunctionDecl>(name, params, std::move(body));
+}
+
+Token Parser::peekToken(size_t offset) const {
+    size_t idx = index + offset;
+    if (idx < tokens.size()) return tokens[idx];
+    return Token{TokenType::EndOfFile, "", 0, 0};
 }

@@ -2,10 +2,13 @@
 
 #include "Expr.h"
 
-class IntegerExpr : public Expr {
-public:
-    int value;
+namespace cruft {
+    class IntegerExpr : public Expr {
+    public:
+        int value;
 
-    IntegerExpr(int val)
-        : value(val) {}
-};
+        IntegerExpr(int val)
+            : value(val) {}
+    };
+}
+

@@ -1,141 +1,184 @@
+// src/codegen/CodeGen.cpp
 #include "CodeGen.h"
+#include "ir/IR.h"
+#include "../parser/AST.h"
+#include "../parser/stm/FunctionDecl.h"
+#include "../parser/stm/VarDeclStatement.h"
+#include "../parser/stm/ConstDeclStatement.h"
+#include "../parser/stm/PrintStatement.h"
+#include "../parser/stm/ReturnStatement.h"
+#include "../parser/stm/IfStatement.h"
+#include "../parser/stm/WhileStatement.h"
+#include "../parser/stm/AssignmentStatement.h"
+#include "../parser/stm/BinaryExpr.h"
+#include "../parser/stm/IntegerExpr.h"
+#include "../parser/stm/VariableExpr.h"
+#include "../parser/stm/CallExpr.h"
+#include "../parser/stm/Expr.h"
+#include <stdexcept>
+#include <functional>
 
-CodeGen::CodeGen(std::ostream& output)
-    : out(output), labelCount(0) {}
+using namespace codegen;
+using namespace codegen::ir;
 
-void CodeGen::emit(const std::string& code) {
-    out << code << "\n";
+CodeGen::CodeGen(std::ostream& o) : out(o) {}
+
+void CodeGen::generate(const cruft::Program& prog) {
+    lowerToIR(prog);
+    allocateRegisters();
+    peepholeOptimize();
+    emitAsm();
 }
 
-std::string CodeGen::uniqueLabel(const std::string& base) {
-    return base + std::to_string(labelCount++);
-}
-
-void CodeGen::generate(const Program& prog) {
-    emit("section .data");
-    emit("fmt_int: db \"%d\", 10, 0");
-
-    // globals
+// Lower AST into linear IR
+void CodeGen::lowerToIR(const cruft::Program& prog) {
     for (auto& stmt : prog.statements) {
-        if (auto vd = dynamic_cast<VarDeclStatement*>(stmt.get())) {
-            emit(vd->name + ": dq 0");
-        }
-        if (auto cd = dynamic_cast<ConstDeclStatement*>(stmt.get())) {
-            emit(cd->name + ": dq " + std::to_string(cd->initializer->value));
+        if (auto fn = dynamic_cast<cruft::FunctionDecl*>(stmt.get())) {
+            // function label
+            ir.emplace_back(std::make_unique<ir::IRLabel>(fn->name));
+            // prologue: push rbp; mov rbp,rsp
+            ir.emplace_back(std::make_unique<ir::IRCall>("__prologue", std::vector<std::string>{}, ""));
+            // params to temps
+            static const char* regs[] = {"rdi","rsi","rdx","rcx","r8","r9"};
+            for (size_t i = 0; i < fn->parameters.size(); ++i) {
+                std::string tmp = "t" + std::to_string(labelCount++);
+                ir.emplace_back(std::make_unique<ir::IRBinary>(ir::IRBinary::Add, tmp, regs[i], "0"));
+                regMap[tmp] = regs[i];
+            }
+            // body
+            std::function<std::string(std::shared_ptr<cruft::Expr>)> genExpr;
+            genExpr = [&](std::shared_ptr<cruft::Expr> e) -> std::string {
+                if (auto b = dynamic_cast<cruft::BinaryExpr*>(e.get())) {
+                    auto l = genExpr(b->left);
+                    auto r = genExpr(b->right);
+                    std::string dst = "t" + std::to_string(labelCount++);
+                    ir.emplace_back(std::make_unique<ir::IRBinary>(
+                        (ir::IRBinary::Op)([&]{
+                            using Op=ir::IRBinary::Op;
+                            if (b->op.value=="+") return Op::Add;
+                            if (b->op.value=="-") return Op::Sub;
+                            if (b->op.value=="*") return Op::Mul;
+                            if (b->op.value=="/") return Op::Div;
+                            throw std::runtime_error("unsupported op");
+                        })(), dst, l, r));
+                    return dst;
+                }
+                if (auto i = dynamic_cast<cruft::IntegerExpr*>(e.get())) {
+                    std::string dst = "t" + std::to_string(labelCount++);
+                    ir.emplace_back(std::make_unique<ir::IRBinary>(ir::IRBinary::Add, dst, std::to_string(i->value), "0"));
+                    return dst;
+                }
+                if (auto v = dynamic_cast<cruft::VariableExpr*>(e.get())) {
+                    return v->name;
+                }
+                if (auto c = dynamic_cast<cruft::CallExpr*>(e.get())) {
+                    std::vector<std::string> args;
+                    for (auto& a : c->args) args.push_back(genExpr(a));
+                    std::string dst = "t" + std::to_string(labelCount++);
+                    ir.emplace_back(std::make_unique<ir::IRCall>(c->callee, args, dst));
+                    return dst;
+                }
+                throw std::runtime_error("unknown expr");
+            };
+            for (auto& s : fn->body) {
+                if (auto pd = dynamic_cast<cruft::PrintStatement*>(s.get())) {
+                    auto v = genExpr(pd->expression);
+                    ir.emplace_back(std::make_unique<ir::IRCall>("printf", std::vector<std::string>{"fmt_int", v}, ""));
+                }
+                else if (auto rd = dynamic_cast<cruft::ReturnStatement*>(s.get())) {
+                    auto v = genExpr(rd->value);
+                    ir.emplace_back(std::make_unique<ir::IRReturn>(v));
+                }
+                // TODO: handle IfStatement, WhileStatement, Assignments
+            }
+            // epilogue
+            ir.emplace_back(std::make_unique<ir::IRCall>("__epilogue", std::vector<std::string>{}, ""));
         }
     }
+}
 
+// Naive register allocation: map temps to RAX, RBX, RCX... in round-robin
+void CodeGen::allocateRegisters() {
+    const std::vector<std::string> regs = {"rax","rbx","rcx","rdx","rsi","rdi"};
+    size_t idx = 0;
+    for (auto& inst : ir) {
+        if (auto bin = dynamic_cast<ir::IRBinary*>(inst.get())) {
+            if (regMap.find(bin->dst)==regMap.end()) regMap[bin->dst] = regs[idx++ % regs.size()];
+            if (regMap.find(bin->lhs)==regMap.end()) regMap[bin->lhs] = regs[idx++ % regs.size()];
+            if (regMap.find(bin->rhs)==regMap.end()) regMap[bin->rhs] = regs[idx++ % regs.size()];
+        }
+        if (auto call = dynamic_cast<ir::IRCall*>(inst.get())) {
+            for (auto& a: call->args) if (regMap.find(a)==regMap.end()) regMap[a] = regs[idx++ % regs.size()];
+            if (!call->dst.empty() && regMap.find(call->dst)==regMap.end()) regMap[call->dst] = "rax";
+        }
+    }
+}
+
+// Simple peephole: remove add X, 0
+void CodeGen::peepholeOptimize() {
+    std::vector<std::unique_ptr<ir::IRInst>> filtered;
+    for (auto& inst : ir) {
+        if (auto bin = dynamic_cast<ir::IRBinary*>(inst.get())) {
+            if (bin->op==ir::IRBinary::Add && bin->rhs=="0") continue;
+        }
+        filtered.push_back(std::move(inst));
+    }
+    ir.swap(filtered);
+}
+
+// Emit final assembly
+void CodeGen::emitAsm() {
+    // data
+    emit("section .data");
+    emit("fmt_int: db \"%d\",10,0");
+    // text
     emit("section .text");
     emit("extern printf");
     emit("global main");
 
-    for (auto& stmt : prog.statements) {
-        if (auto fn = dynamic_cast<FunctionDecl*>(stmt.get())) {
-            genFunction(*fn);
+    for (auto& inst : ir) {
+        if (auto lbl = dynamic_cast<ir::IRLabel*>(inst.get())) {
+            emit(lbl->name + ":");
+            continue;
+        }
+        if (auto bin = dynamic_cast<ir::IRBinary*>(inst.get())) {
+            auto d = regMap[bin->dst];
+            auto a = regMap[bin->lhs];
+            auto b = regMap[bin->rhs];
+            if (bin->op==ir::IRBinary::Add)      emit("    mov " + d + ", " + a), emit("    add " + d + ", " + b);
+            else if (bin->op==ir::IRBinary::Sub) emit("    mov " + d + ", " + a), emit("    sub " + d + ", " + b);
+            else if (bin->op==ir::IRBinary::Mul) emit("    mov " + d + ", " + a), emit("    imul " + d + ", " + b);
+            else if (bin->op==ir::IRBinary::Div) {
+                emit("    mov rax, " + a);
+                emit("    cqo");
+                emit("    idiv " + b);
+                emit("    mov " + d + ", rax");
+            }
+            continue;
+        }
+        if (auto call = dynamic_cast<ir::IRCall*>(inst.get())) {
+            for (size_t i=0;i<call->args.size()&&i<6;++i) {
+                static const char* regs[] = {"rdi","rsi","rdx","rcx","r8","r9"};
+                emit("    mov " + std::string(regs[i]) + ", " + regMap[call->args[i]]);
+            }
+            emit(std::string("    call ") + call->fn);
+            if (!call->dst.empty() && call->fn!="__prologue" && call->fn!="__epilogue") {
+                emit("    mov " + regMap[call->dst] + ", rax");
+            }
+            continue;
+        }
+        if (auto ret = dynamic_cast<ir::IRReturn*>(inst.get())) {
+            emit("    mov rax, " + regMap[ret->value]);
+            emit("    ret");
+            continue;
         }
     }
 }
 
-void CodeGen::genFunction(const FunctionDecl& f) {
-    emit(f.name + ":");
-    emit("    push rbp");
-    emit("    mov rbp, rsp");
-    emit("    sub rsp, 32"); // reserve stack
-
-    for (auto& st : f.body) genStatement(st);
-
-    emit("    mov rsp, rbp");
-    emit("    pop rbp");
-    emit("    ret");
+std::string CodeGen::uniqueLabel(const std::string& base) {
+    return base + "_" + std::to_string(labelCount++);
 }
 
-void CodeGen::genStatement(const std::shared_ptr<Statement>& s) {
-    if (auto p = dynamic_cast<PrintStatement*>(s.get())) genPrint(*p);
-    else if (auto r = dynamic_cast<ReturnStatement*>(s.get())) genReturn(*r);
-    else if (auto iff = dynamic_cast<IfStatement*>(s.get())) genIf(*iff);
-    else if (auto wh = dynamic_cast<WhileStatement*>(s.get())) genWhile(*wh);
-    else if (auto vd = dynamic_cast<VarDeclStatement*>(s.get())) genVarDecl(*vd);
-    else if (auto cd = dynamic_cast<ConstDeclStatement*>(s.get())) genConstDecl(*cd);
-    else if (auto asg = dynamic_cast<AssignmentStatement*>(s.get())) genAssignment(*asg);
-}
-
-void CodeGen::genPrint(const PrintStatement& p) {
-    genExpr(p.expression);
-    emit("    mov rdi, fmt_int");
-    emit("    mov rsi, rax");
-    emit("    xor rax, rax");
-    emit("    call printf");
-}
-
-void CodeGen::genReturn(const ReturnStatement& r) {
-    genExpr(r.value);
-    emit("    mov rsp, rbp");
-    emit("    pop rbp");
-    emit("    ret");
-}
-
-void CodeGen::genIf(const IfStatement& iff) {
-    std::string elseL = uniqueLabel("else");
-    std::string endL  = uniqueLabel("endif");
-    genExpr(iff.condition);
-    emit("    cmp rax, 0");
-    emit("    je " + elseL);
-    for (auto& st : iff.thenBranch) genStatement(st);
-    emit("    jmp " + endL);
-    emit(elseL + ":");
-    for (auto& st : iff.elseBranch) genStatement(st);
-    emit(endL + ":");
-}
-
-void CodeGen::genWhile(const WhileStatement& wh) {
-    std::string startL = uniqueLabel("while_start");
-    std::string endL   = uniqueLabel("while_end");
-    emit(startL + ":");
-    genExpr(wh.condition);
-    emit("    cmp rax, 0");
-    emit("    je " + endL);
-    for (auto& st : wh.body) genStatement(st);
-    emit("    jmp " + startL);
-    emit(endL + ":");
-}
-
-void CodeGen::genVarDecl(const VarDeclStatement& v) {
-    // placeholder: locals handled in stack frame
-}
-
-void CodeGen::genConstDecl(const ConstDeclStatement& c) {
-    // no runtime code, handled in data section
-}
-
-void CodeGen::genAssignment(const AssignmentStatement& a) {
-    genExpr(a.value);
-    emit("    mov [rbp-8], rax");
-}
-
-void CodeGen::genExpr(const std::shared_ptr<Expr>& e) {
-    if (auto b = dynamic_cast<BinaryExpr*>(e.get())) genBinary(*b);
-    else if (auto i = dynamic_cast<IntegerExpr*>(e.get())) genInteger(*i);
-    else if (auto v = dynamic_cast<VariableExpr*>(e.get())) genVariable(*v);
-}
-
-void CodeGen::genBinary(const BinaryExpr& b) {
-    genExpr(b.left);
-    emit("    push rax");
-    genExpr(b.right);
-    emit("    pop rcx");
-    if (b.op.value == "+") emit("    add rax, rcx");
-    else if (b.op.value == "-") {
-        emit("    mov rdx, rcx");
-        emit("    sub rdx, rax");
-        emit("    mov rax, rdx");
-    }
-    else if (b.op.value == "*") emit("    imul rax, rcx");
-}
-
-void CodeGen::genInteger(const IntegerExpr& i) {
-    emit("    mov rax, " + std::to_string(i.value));
-}
-
-void CodeGen::genVariable(const VariableExpr& v) {
-    emit("    mov rax, [" + v.name + "]");
+void CodeGen::emit(const std::string& line) {
+    out << line << "\n";
 }

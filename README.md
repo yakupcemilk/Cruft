@@ -16,7 +16,7 @@ package main
 i32 const a, b = 10
 
 pub fn main(a: i32, b: i32): i32
-    c = a + b
+    c: i32 = a + b
     print(c)
 end
 ```
