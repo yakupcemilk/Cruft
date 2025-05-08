@@ -12,21 +12,34 @@
 #include "stm/VarDeclStatement.h"
 #include "stm/VariableExpr.h"
 #include "stm/WhileStatement.h"
-
+#include <iostream>
 #include <stdexcept>
 
 using namespace cruft;
 
 // Entry point: parse a sequence of statements into a Program
 std::shared_ptr<Program> Parser::parseProgram() {
+  std::cerr << "[parser] Entering parseProgram, tokens size = " << tokens.size()
+            << "\n";
+
   auto prog = std::make_shared<Program>();
+
   while (currentToken().type != TokenType::EndOfFile) {
+    std::cerr << "[parser] Current token: type=" << (int)currentToken().type
+              << ", value='" << currentToken().value << "'\n";
+
     auto stmt = parseStatement();
-    if (stmt)
+
+    if (stmt) {
+      std::cerr << "[parser] Parsed a statement successfully\n";
       prog->statements.push_back(stmt);
-    else
-      advance();
+    } else {
+      std::cerr << "[parser] parseStatement() returned null, advancing\n";
+      advance(); // Avoid infinite loop
+    }
   }
+
+  std::cerr << "[parser] Finished parseProgram\n";
   return prog;
 }
 
@@ -206,9 +219,26 @@ std::shared_ptr<Statement> Parser::parseFunctionDecl() {
     advance();
   }
   std::vector<std::shared_ptr<Statement>> body;
+  int safety = 0;
   while (!(currentToken().type == TokenType::Keyword &&
            currentToken().value == "end")) {
-    body.push_back(parseStatement() ?: (advance(), nullptr));
+
+    std::cerr << "[parser] Inside function body, current token: "
+              << currentToken().value << "\n";
+
+    auto stmt = parseStatement();
+    if (stmt) {
+      body.push_back(stmt);
+    } else {
+      std::cerr << "[parser] Null statement inside function, advancing\n";
+      advance();
+    }
+
+    if (++safety > 1000) {
+      std::cerr << "[parser] Safety break: too many iterations in function "
+                   "body parsing\n";
+      break;
+    }
   }
   advance(); // 'end'
   return std::make_shared<FunctionDecl>(name, params, body);

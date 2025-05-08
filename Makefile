@@ -1,102 +1,75 @@
 #
-# 'make'        build executable file 'main'
-# 'make clean'  removes all .o and executable files
+# 'make'         → build both 'cruft' and 'cruftc'
+# 'make cruft'   → build assembler back‑end (cruft)
+# 'make cruftc'  → build C++ back‑end   (cruftc)
+# 'make clean'   → remove all .o, .d, and executables
 #
 
-# define the Cpp compiler to use
-CXX = g++
+# compiler & flags
+CXX        := g++
+# make sure we can `#include "<whatever>.h"` from both include/ and src/
+CXXFLAGS  := -std=c++23 -Wall -Wextra -g -Iinclude -Isrc
 
-# define any compile-time flags
-CXXFLAGS	:= -std=c++23 -Wall -Wextra -g -Iinclude
+# directories
+SRC        := src
+INCLUDE    := include
+OUTPUT     := output
+OBJDIR     := $(OUTPUT)/obj
 
-# define library paths in addition to /usr/lib
-#   if I wanted to include libraries not in /usr/lib I'd specify
-#   their path using -Lpath, something like:
-LFLAGS =
-
-# define output directory
-OUTPUT	:= output
-
-# define source directory
-SRC		:= src
-
-# define include directory
-INCLUDE	:= include
-
-# define lib directory
-LIB		:= lib
-
-# define test directory
-TEST	:= test
-
+# find all subdirs for includes
 ifeq ($(OS),Windows_NT)
-MAIN	:= main.exe
-SOURCEDIRS	:= $(SRC)
-INCLUDEDIRS	:= $(INCLUDE)
-LIBDIRS		:= $(LIB)
-FIXPATH = $(subst /,\,$1)
-RM			:= del /q /f
-MD	:= mkdir
+  RM     := del /q /f
+  MD     := mkdir
+  FIX    := $(subst /,\,$1)
 else
-MAIN	:= main
-SOURCEDIRS	:= $(shell find $(SRC) -type d)
-INCLUDEDIRS	:= $(shell find $(INCLUDE) -type d)
-LIBDIRS		:= $(shell find $(LIB) -type d)
-FIXPATH = $1
-RM = rm -f
-MD	:= mkdir -p
+  RM     := rm -f
+  MD     := mkdir -p
+  FIX    := $1
 endif
 
-# define any directories containing header files other than /usr/include
-INCLUDES	:= $(patsubst %,-I%, $(INCLUDEDIRS:%/=%))
+# collect all source files
+SOURCES   := $(shell find $(SRC) -name '*.cpp')
+OBJECTS   := $(patsubst $(SRC)/%.cpp,$(OBJDIR)/%.o,$(SOURCES))
+DEPS      := $(OBJECTS:.o=.d)
 
-# define the C libs
-LIBS		:= $(patsubst %,-L%, $(LIBDIRS:%/=%))
+# include paths
+INCDIRS   := $(shell find $(INCLUDE) -type d)
+INCLUDES  := $(patsubst %,-I%,$(INCDIRS))
 
-# define the C source files
-SOURCES		:= $(wildcard $(patsubst %,%/*.cpp, $(SOURCEDIRS)))
+.PHONY: all cruft cruftc clean run
 
-# define the C object files
-OBJECTS		:= $(SOURCES:.cpp=.o)
+all: cruft cruftc
 
-# define the dependency output files
-DEPS		:= $(OBJECTS:.o=.d)
+cruft: $(OUTPUT) $(OUTPUT)/cruft
 
-#
-# The following part of the makefile is generic; it can be used to
-# build any executable just by changing the definitions above and by
-# deleting dependencies appended to the file from 'make depend'
-#
+cruftc: $(OUTPUT) $(OUTPUT)/cruftc
 
-OUTPUTMAIN	:= $(call FIXPATH,$(OUTPUT)/$(MAIN))
+# main assembler back‑end
+$(OUTPUT)/cruft: $(filter-out $(OBJDIR)/codegen/cpp/CodeGenC.o,$(OBJECTS))
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ 
 
-all: $(OUTPUT) $(MAIN)
-	@echo Executing 'all' complete!
+# C++ emitter back‑end: include both back‑ends’ objects so main() links
+$(OUTPUT)/cruftc: $(OBJECTS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^
+# compile .cpp → .o and generate .d
+$(OBJDIR)/%.o: $(SRC)/%.cpp
+	@$(MD) $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -MMD -MF $(@:.o=.d) -o $@
 
+# include auto‑generated dependencies
+-include $(DEPS)
+
+# ensure OUTPUT directory exists
 $(OUTPUT):
 	$(MD) $(OUTPUT)
 
-$(MAIN): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(OUTPUTMAIN) $(OBJECTS) $(LFLAGS) $(LIBS)
-
-# include all .d files
--include $(DEPS)
-
-# this is a suffix replacement rule for building .o's and .d's from .c's
-# it uses automatic variables $<: the name of the prerequisite of
-# the rule(a .c file) and $@: the name of the target of the rule (a .o file)
-# -MMD generates dependency output files same name as the .o file
-# (see the gnu make manual section about automatic variables)
-.cpp.o:
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -MMD $<  -o $@
-
-.PHONY: clean
 clean:
-	$(RM) $(OUTPUTMAIN)
-	$(RM) $(call FIXPATH,$(OBJECTS))
-	$(RM) $(call FIXPATH,$(DEPS))
-	@echo Cleanup complete!
+	$(RM) $(call FIX,$(OUTPUT)/*)
+	$(RM) $(call FIX,$(OBJDIR)/**/*.o) $(call FIX,$(OBJDIR)/**/*.d)
+	@echo "Clean complete!"
 
 run: all
-	./$(OUTPUTMAIN)
-	@echo Executing 'run: all' complete!
+	./$(OUTPUT)/cruft
+	@echo "Ran assembler back‑end."
+	./$(OUTPUT)/cruftc
+	@echo "Ran C++ back‑end."

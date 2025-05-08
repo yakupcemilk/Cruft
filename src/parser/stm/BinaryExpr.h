@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Expr.h"
-#include "../src/lexer/Lexer.h"
+#include "../../lexer/Lexer.h"
 #include <memory>
 
 namespace cruft {

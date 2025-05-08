@@ -24,6 +24,7 @@ using namespace codegen::ir;
 CodeGen::CodeGen(std::ostream& o) : out(o) {}
 
 void CodeGen::generate(const cruft::Program& prog) {
+    std::cerr << "[CodeGen] lowering to IR...\n";
     lowerToIR(prog);
     allocateRegisters();
     peepholeOptimize();
@@ -162,69 +163,100 @@ void CodeGen::peepholeOptimize() {
 }
 
 void CodeGen::emitAsm() {
-    // data
+    // --- data section ---
     emit("section .data");
-    emit("fmt_int: db \"%d\",10,0");
+    emit("fmt_int:    db \"%d\", 10, 0");
 
-    // text
+    // --- text section ---
     emit("section .text");
     emit("extern printf");
     emit("extern retain");
     emit("extern release");
+    emit("extern __prologue");
+    emit("extern __epilogue");
     emit("global main");
+
+    // argument‐register names
+    static const char* argregs[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
 
     for (auto& inst : ir) {
         if (auto lbl = dynamic_cast<IRLabel*>(inst.get())) {
+            emit("");                        // blank line before each function/label
             emit(lbl->name + ":");
             continue;
         }
+
         if (auto bin = dynamic_cast<IRBinary*>(inst.get())) {
-            auto d = regMap[bin->dst], a = regMap[bin->lhs], b = regMap[bin->rhs];
+            // move lhs into dst
+            auto dst = regMap[bin->dst];
+            auto lhs = bin->lhs;
+            // detect numeric immediate vs. register/variable
+            bool lhsIsImm = std::isdigit(lhs[0]);
+            if (lhsIsImm) {
+                emit("    mov " + dst + ", " + lhs);
+            } else {
+                emit("    mov " + dst + ", " + regMap[lhs]);
+            }
+
+            // apply operation
+            auto rhsReg = bin->rhs;
+            bool rhsIsImm = std::isdigit(rhsReg[0]);
+            auto rhsOpnd = rhsIsImm ? rhsReg : regMap[rhsReg];
+
             switch (bin->op) {
                 case IRBinary::Add:
-                    emit("    mov " + d + ", " + a);
-                    emit("    add " + d + ", " + b);
+                    emit("    add " + dst + ", " + rhsOpnd);
                     break;
                 case IRBinary::Sub:
-                    emit("    mov " + d + ", " + a);
-                    emit("    sub " + d + ", " + b);
+                    emit("    sub " + dst + ", " + rhsOpnd);
                     break;
                 case IRBinary::Mul:
-                    emit("    mov " + d + ", " + a);
-                    emit("    imul " + d + ", " + b);
+                    emit("    imul " + dst + ", " + rhsOpnd);
                     break;
                 case IRBinary::Div:
-                    emit("    mov rax, " + a);
+                    // x86-64 division always uses RAX:RDX
+                    emit("    mov rax, " + dst);
                     emit("    cqo");
-                    emit("    idiv " + b);
-                    emit("    mov " + d + ", rax");
+                    emit("    idiv " + rhsOpnd);
+                    emit("    mov " + dst + ", rax");
                     break;
                 default:
-                    break;
+                    throw std::runtime_error("Unhandled IRBinary op in emitAsm");
             }
             continue;
         }
+
         if (auto call = dynamic_cast<IRCall*>(inst.get())) {
-            static const char* argregs[] = {"rdi","rsi","rdx","rcx","r8","r9"};
-            for (size_t i = 0; i < call->args.size() && i < 6; ++i)
-                emit("    mov " + std::string(argregs[i]) + ", " + regMap[call->args[i]]);
+            // move arguments into argregs
+            for (size_t i = 0; i < call->args.size() && i < 6; ++i) {
+                auto a = call->args[i];
+                // immediate vs. register
+                if (std::isdigit(a[0]))
+                    emit("    mov " + std::string(argregs[i]) + ", " + a);
+                else
+                    emit("    mov " + std::string(argregs[i]) + ", " + regMap[a]);
+            }
+            // actual call
             emit("    call " + call->fn);
+
+            // if the call returns a value, it will be in RAX
             if (!call->dst.empty()) {
-                // store in dst-reg (rax), already retained in IR
                 emit("    mov " + regMap[call->dst] + ", rax");
             }
             continue;
         }
+
         if (auto ret = dynamic_cast<IRReturn*>(inst.get())) {
-            // release return value inside RAX
-            emit("    mov rdi, " + regMap[ret->value]);
-            emit("    call release");
+            // return value should already be in some register
             emit("    mov rax, " + regMap[ret->value]);
+            // clean‐up (if you have an epilogue stub)
+            emit("    call __epilogue");
             emit("    ret");
             continue;
         }
     }
 }
+
 
 std::string CodeGen::uniqueLabel(const std::string& base) {
     return base + "_" + std::to_string(labelCount++);
