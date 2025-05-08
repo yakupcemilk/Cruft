@@ -1,25 +1,34 @@
 #pragma once
+#include "Token.h"
 #include <string>
 #include <vector>
-#include "Token.h"
+
+namespace cruft {
 
 class Lexer {
 public:
-    explicit Lexer(const std::string& input);
+    explicit Lexer(const std::string& source);
+
     Token nextToken();
-    std::vector<Token> tokenize();    // now implemented
+    std::vector<Token> getTokens() {
+        return tokenize();
+    }
 
 private:
     std::string input;
-    size_t index = 0, line = 1, column = 1;
+    size_t pos = 0;
+    int line = 1;
 
-    char currentChar() const;
-    char peek() const;
     void advance();
+    bool matchNext(char expected) const;
     void skipWhitespace();
-    void skipComment();
-    Token generateKeywordOrIdentifier();
-    Token generateInteger();
-    Token generateOperator();
-    Token generatePunctuation();
+    void skipBlockComment();
+
+    Token lexLineComment();
+    Token lexIdentifierOrKeyword();
+    Token lexNumber();
+    Token lexString();
+    std::vector<Token> tokenize();
 };
+
+} // namespace cruft

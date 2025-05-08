@@ -1,13 +1,13 @@
 package test
-
 var x: i32 = 39
-
 const y: i32 = 42
 
-pri fn add(x: i32, y: i32): i32
-    z: i32 = x + y
+fn add(x: i32, y: i32): i32
+    var z: i32 = x + y
+    ret z
 end
 
-pub fn main(z: i32): i32
-    print(z)
+pub fn main(): i32
+    print(add(x, y))
+    ret 0
 end

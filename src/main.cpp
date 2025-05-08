@@ -1,22 +1,23 @@
 // src/main.cpp
+#include "codegen/CodegenC.h"
+#include "lexer/Lexer.h"
+#include "parser/Parser.h"
 #include <fstream>
 #include <iostream>
 #include <sstream>
 
-#include "codegen/CodeGen.h"
-#include "codegen/cpp/CodegenC.h"
-#include "lexer/Lexer.h"
-#include "parser/Parser.h"
+using namespace cruft;
 
 int main(int argc, char **argv) {
   bool toC = false;
   std::string filename;
 
   for (int i = 1; i < argc; ++i) {
-    if (std::string(argv[i]) == "-c") {
+    std::string arg = argv[i];
+    if (arg == "-c") {
       toC = true;
     } else {
-      filename = argv[i];
+      filename = arg;
     }
   }
 
@@ -26,7 +27,7 @@ int main(int argc, char **argv) {
   }
 
   std::ifstream file(filename);
-  if (!file.is_open()) {
+  if (!file) {
     std::cerr << "Failed to open " << filename << "\n";
     return 1;
   }
@@ -35,33 +36,16 @@ int main(int argc, char **argv) {
   buffer << file.rdbuf();
   std::string source = buffer.str();
 
-  std::cerr << "[main] Read " << source.size() << " bytes of input\n";
-
   // Lex & parse
-  Lexer lexer(source);
-  std::cerr << "[main] Starting lexing...\n";
-  auto tokens = lexer.tokenize();
-  std::cerr << "[main] Starting parsing...\n";
+  cruft::Lexer lexer(source);
+  auto tokens = lexer.getTokens();
   cruft::Parser parser(tokens);
   auto prog = parser.parseProgram();
-  std::cerr << "[main] Parsed program, functions: " << prog->statements.size()
-            << "\n";
+
+  // Generate C++ if requested
   if (toC) {
-    // Fully‑qualified path into cruft::codegen::cpp
     cruft::codegen::cpp::CodeGenC generator(std::cout);
     generator.generate(*prog);
-
-    std::cerr << "[main] Generating C++...\n";
-    generator.generate(*prog);
-    std::cerr << "[main] Done.\n";
-  } else {
-    // Fully‑qualified use of the assembler back‑end
-    codegen::CodeGen generator(std::cout);
-    generator.generate(*prog);
-
-    std::cerr << "[main] Generating x86 NASM...\n";
-    generator.generate(*prog);
-    std::cerr << "[main] Done.\n";
   }
 
   return 0;

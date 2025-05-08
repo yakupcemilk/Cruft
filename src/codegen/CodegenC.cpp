@@ -1,4 +1,4 @@
-// src/codegen/cpp/CodeGenC.cpp
+// src/codegen/cpp/CodegenC.cpp
 #include "CodegenC.h"
 #include <stdexcept>
 
@@ -13,18 +13,19 @@ void CodeGenC::generate(const cruft::Program& prog) {
     emitLine("#include <iostream>");
     emitLine("#include <memory>");
     emitLine("");
+
     // Package isolation
     emitLine("namespace " + prog.packageName + " {");
     emitLine("");
 
     // Build IR and optimize
     lowerToIR(prog);
-    allocateRegisters();
     peepholeOptimize();
 
     // Emit C++ functions
     emitC();
 
+    // Close namespace
     emitLine("");
     emitLine("} // namespace " + prog.packageName);
 }
@@ -33,6 +34,13 @@ void CodeGenC::lowerToIR(const cruft::Program& prog) {
     ir.clear();
     labelCount = 0;
 
+    // record parameter lists
+    for (auto& stmt : prog.statements) {
+        if (auto fn = std::dynamic_pointer_cast<cruft::FunctionDecl>(stmt)) {
+            fnParams[fn->name] = fn->parameters;
+        }
+    }
+
     // define expression generator
     genExpr = [&](std::shared_ptr<cruft::Expr> e) -> std::string {
         if (auto b = std::dynamic_pointer_cast<cruft::BinaryExpr>(e)) {
@@ -40,10 +48,10 @@ void CodeGenC::lowerToIR(const cruft::Program& prog) {
             auto r = genExpr(b->right);
             std::string dst = "tmp" + std::to_string(labelCount++);
             IRBinary::Op op;
-            if (b->op.value == "+") op = IRBinary::Add;
-            else if (b->op.value == "-") op = IRBinary::Sub;
-            else if (b->op.value == "*") op = IRBinary::Mul;
-            else if (b->op.value == "/") op = IRBinary::Div;
+            if (b->op.lexeme == "+") op = IRBinary::Add;
+            else if (b->op.lexeme == "-") op = IRBinary::Sub;
+            else if (b->op.lexeme == "*") op = IRBinary::Mul;
+            else if (b->op.lexeme == "/") op = IRBinary::Div;
             else throw std::runtime_error("unsupported op");
             ir.emplace_back(std::make_unique<IRBinary>(op, dst, l, r));
             return dst;
@@ -66,16 +74,14 @@ void CodeGenC::lowerToIR(const cruft::Program& prog) {
         throw std::runtime_error("unknown expr");
     };
 
-    // Lower each top‑level statement
+    // Lower each top-level statement
     for (auto& stmt : prog.statements) {
         if (auto fn = std::dynamic_pointer_cast<cruft::FunctionDecl>(stmt)) {
             // label
             ir.emplace_back(std::make_unique<IRLabel>(fn->name));
-            // parameters are assumed all int
-            for (auto& param : fn->parameters) {
-                // declare param variable
-                // (we'll refer to by name directly in C)
-            }
+
+            // parameters are referred to directly in emitC()
+
             // body
             for (auto& s : fn->body) {
                 if (auto pd = std::dynamic_pointer_cast<cruft::PrintStatement>(s)) {
@@ -92,7 +98,6 @@ void CodeGenC::lowerToIR(const cruft::Program& prog) {
                         auto v = genExpr(vd->initializer);
                         ir.emplace_back(std::make_unique<IRBinary>(IRBinary::Add, vd->name, v, "0"));
                     } else {
-                        // default zero
                         ir.emplace_back(std::make_unique<IRBinary>(IRBinary::Add, vd->name, "0", "0"));
                     }
                 }
@@ -108,13 +113,12 @@ void CodeGenC::lowerToIR(const cruft::Program& prog) {
                     ir.emplace_back(std::make_unique<IRCondJump>(cond, thenL, elseL));
                     ir.emplace_back(std::make_unique<IRLabel>(thenL));
                     for (auto& ts : iff->thenBranch) {
-                        // recursively lower each
-                        // (for brevity we assume no nested control here)
+                        // nested lowering omitted for brevity
                     }
                     ir.emplace_back(std::make_unique<IRJump>(endL));
                     ir.emplace_back(std::make_unique<IRLabel>(elseL));
                     for (auto& es : iff->elseBranch) {
-                        // lower
+                        // nested lowering omitted for brevity
                     }
                     ir.emplace_back(std::make_unique<IRLabel>(endL));
                 }
@@ -125,7 +129,7 @@ void CodeGenC::lowerToIR(const cruft::Program& prog) {
                     auto cond = genExpr(wh->condition);
                     ir.emplace_back(std::make_unique<IRCondJump>(cond, startL, endL));
                     for (auto& bs : wh->body) {
-                        // lower
+                        // nested lowering omitted for brevity
                     }
                     ir.emplace_back(std::make_unique<IRJump>(startL));
                     ir.emplace_back(std::make_unique<IRLabel>(endL));
@@ -136,14 +140,13 @@ void CodeGenC::lowerToIR(const cruft::Program& prog) {
 }
 
 void CodeGenC::allocateRegisters() {
-    // no-op: C++ backend doesn’t use regs
+    // no-op: C++ backend doesn’t use registers
 }
 
 void CodeGenC::peepholeOptimize() {
     std::vector<std::unique_ptr<IRInst>> filtered;
     for (auto& inst : ir) {
         if (auto bin = dynamic_cast<IRBinary*>(inst.get())) {
-            // remove x = x + 0
             if (bin->op == IRBinary::Add && bin->rhs == "0" && bin->dst == bin->lhs)
                 continue;
         }
@@ -152,48 +155,37 @@ void CodeGenC::peepholeOptimize() {
     ir.swap(filtered);
 }
 
-std::string CodeGenC::joinArgs(const std::vector<std::string>& args) {
-    std::string out;
-    for (size_t i = 0; i < args.size(); ++i) {
-        if (i) out += ", ";
-        out += args[i];
-    }
-    return out;
-}
-
 void CodeGenC::emitC() {
     std::string currentFn;
-    // Emit function signatures and bodies
     for (size_t i = 0; i < ir.size(); ++i) {
         IRInst* inst = ir[i].get();
+
         if (auto lbl = dynamic_cast<IRLabel*>(inst)) {
-            currentFn = lbl->name;
-            // find the original FunctionDecl to get parameters
-            emitLine("int " + currentFn + "(" + /* assume all int params */ "int argc, char** argv" + ") {");
-            continue;
-        }
-        if (auto bin = dynamic_cast<IRBinary*>(inst)) {
-            std::string a = bin->lhs;
-            std::string b = bin->rhs;
-            std::string d = bin->dst;
-            switch (bin->op) {
-                case IRBinary::Add:
-                    emitLine("    int " + d + " = " + a + " + " + b + ";");
-                    break;
-                case IRBinary::Sub:
-                    emitLine("    int " + d + " = " + a + " - " + b + ";");
-                    break;
-                case IRBinary::Mul:
-                    emitLine("    int " + d + " = " + a + " * " + b + ";");
-                    break;
-                case IRBinary::Div:
-                    emitLine("    int " + d + " = " + a + " / " + b + ";");
-                    break;
-                default:
-                    emitLine("    // op not implemented");
+            if (!currentFn.empty()) {
+                emitLine("}");
+                emitLine("");
             }
+            currentFn = lbl->name;
+            auto &params = fnParams[currentFn];
+            std::string sig = "int " + currentFn + "(";
+            for (size_t j = 0; j < params.size(); ++j) {
+                if (j) sig += ", ";
+                sig += "int " + params[j];
+            }
+            sig += ") {";
+            emitLine(sig);
             continue;
         }
+
+        if (auto bin = dynamic_cast<IRBinary*>(inst)) {
+            const char* opStr = bin->op == IRBinary::Add ? "+" :
+                                bin->op == IRBinary::Sub ? "-" :
+                                bin->op == IRBinary::Mul ? "*" :
+                                bin->op == IRBinary::Div ? "/" : "";
+            emitLine("    int " + bin->dst + " = " + bin->lhs + " " + opStr + " " + bin->rhs + ";");
+            continue;
+        }
+
         if (auto call = dynamic_cast<IRCall*>(inst)) {
             std::string args = joinArgs(call->args);
             if (call->dst.empty()) {
@@ -203,25 +195,40 @@ void CodeGenC::emitC() {
             }
             continue;
         }
+
         if (auto cj = dynamic_cast<IRCondJump*>(inst)) {
             emitLine("    if (!(" + cj->cond + ")) goto " + cj->elseLabel + ";");
             continue;
         }
+
         if (auto j = dynamic_cast<IRJump*>(inst)) {
             emitLine("    goto " + j->target + ";");
             continue;
         }
-        if (auto lbl = dynamic_cast<IRLabel*>(inst)) {
-            emitLine(lbl->name + ": ;");
-            continue;
-        }
+
         if (auto ret = dynamic_cast<IRReturn*>(inst)) {
             emitLine("    return " + ret->value + ";");
-            emitLine("}");
-            currentFn.clear();
+            continue;
+        }
+
+        if (auto lbl2 = dynamic_cast<IRLabel*>(inst)) {
+            emitLine(lbl2->name + ": ;");
             continue;
         }
     }
+
+    if (!currentFn.empty()) {
+        emitLine("}");
+    }
+}
+
+std::string CodeGenC::joinArgs(const std::vector<std::string>& args) {
+    std::string out;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) out += ", ";
+        out += args[i];
+    }
+    return out;
 }
 
 std::string CodeGenC::uniqueLabel(const std::string& base) {
