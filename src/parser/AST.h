@@ -3,6 +3,7 @@
 #include <vector>
 #include <memory>
 #include "stm/Statement.h"
+#include <string> 
 
 namespace cruft {
     struct Program {

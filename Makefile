@@ -64,8 +64,13 @@ $(OUTPUT):
 	$(MD) $(OUTPUT)
 
 clean:
-	$(RM) $(call FIX,$(OUTPUT)/*)
-	$(RM) $(call FIX,$(OBJDIR)/**/*.o) $(call FIX,$(OBJDIR)/**/*.d)
+ifeq ($(OS),Windows_NT)
+	@echo Deleting $(OUTPUT) directory on Windows…
+	-rmdir /S /Q $(OUTPUT)
+else
+	@echo Deleting $(OUTPUT) directory…
+	-rm -rf $(OUTPUT)
+endif
 	@echo "Clean complete!"
 
 run: all

@@ -2,7 +2,7 @@ package test
 var x: i32 = 39
 const y: i32 = 42
 
-fn add(x: i32, y: i32): i32
+pri fn add(x: i32, y: i32): i32
     var z: i32 = x + y
     ret z
 end

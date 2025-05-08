@@ -43,7 +43,8 @@ private:
     void allocateRegisters(); // no-op for C
     void peepholeOptimize();
     void emitC();
-
+    void lowerStatement(const std::shared_ptr<cruft::Statement> &stmt);
+    
     // expression-gen helper
     std::function<std::string(std::shared_ptr<cruft::Expr>)> genExpr;
 
