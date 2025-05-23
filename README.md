@@ -13,10 +13,10 @@ Cruft is like a gem that nobody discovered... Nah, I'm joking. Cruft's orientati
 ```go
 package main
 
-i32 const a, b = 10
+const a, b: i32 = 10
 
 pub fn main(a: i32, b: i32): i32
-    c: i32 = a + b
+    c: i32 = a + b 
     print(c)
 end
 ```
