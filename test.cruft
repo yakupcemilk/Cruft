@@ -1,13 +1,15 @@
-package test
-var x: i32 = 39
-const y: i32 = 42
+package main
 
-pri fn add(x: i32, y: i32): i32
+var a: i32 = 10
+const b: i32 = 32
+
+pri fn add_values(x: i32, y: i32): i32
     var z: i32 = x + y
     ret z
 end
 
 pub fn main(): i32
-    print(add(x, y))
+    var result: i32 = add_values(a, b)
+    print(result)
     ret 0
 end
