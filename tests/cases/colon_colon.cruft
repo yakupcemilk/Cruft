@@ -1,0 +1,5 @@
+package bad
+
+pub fn main(): i32
+    ret math::add(1, 2)
+end

@@ -1,0 +1,9 @@
+package escape
+
+pub fn main(): i32
+    var leaked = [1]
+    scope arena
+        leaked = [2, 3, 4]
+    end
+    ret leaked.sum()
+end

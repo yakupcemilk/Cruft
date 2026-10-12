@@ -1,0 +1,14 @@
+package test
+
+var x: i32 = 39
+const y: i32 = 42
+
+pri fn add_internal(a: i32, b: i32): i32
+    var z: i32 = a + b
+    ret z
+end
+
+pub fn main(): i32
+    print(add_internal(x, y))
+    ret 0
+end

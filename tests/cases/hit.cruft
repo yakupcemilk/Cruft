@@ -1,0 +1,29 @@
+package hits
+
+pub type Flag
+    Off
+    On
+end
+
+pub type Circle
+    base
+    loop : Path(Circle, base, base)
+end
+
+pub fn from_flag(b: Flag): i32
+    ret match b
+        case Off then 0
+        case On then 1
+    end
+end
+
+pub fn circle_const(c: Circle): i32
+    // A constant eliminator respects `loop` because both endpoints are `base`.
+    ret match c
+        case base then 0
+    end
+end
+
+pub fn main(): i32
+    ret from_flag(On) + circle_const(base)
+end

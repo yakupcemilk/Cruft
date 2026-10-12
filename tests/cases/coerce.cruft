@@ -1,0 +1,7 @@
+package coerce
+
+pub fn main(): i32
+    var a: i32 = 1
+    var b: i64 = 2
+    ret a + b
+end
