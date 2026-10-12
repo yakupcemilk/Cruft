@@ -1,0 +1,9 @@
+package share
+
+pub fn main(): i32
+    shared var a = [1, 2, 3]
+    shared var b = a
+    print(a.sum())
+    print(b.length())
+    ret 0
+end

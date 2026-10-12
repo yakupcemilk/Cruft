@@ -1,0 +1,9 @@
+package leak
+
+pri type Hidden
+    mk
+end
+
+pub fn expose(): Hidden
+    ret mk
+end

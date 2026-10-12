@@ -1,0 +1,7 @@
+package upper
+
+import lower
+
+pub fn ping(): i32
+    ret 1
+end

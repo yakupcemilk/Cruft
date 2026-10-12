@@ -1,0 +1,15 @@
+package demo
+
+pub fn main(): i32
+    var numbers = [1, 2, 3, 4, 5]
+    var evens = numbers.filter(fn(x) => x % 2 == 0).map(fn(x) => x * 2)
+    var n: i32 = evens.length()
+    var s: i32 = evens.sum()
+    scope arena
+        var temp = [10, 20, 30]
+        print(temp.sum())
+    end
+    print(n)
+    print(s)
+    ret 0
+end

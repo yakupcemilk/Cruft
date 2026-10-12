@@ -1,0 +1,11 @@
+package hott
+
+pub fn main(): i32
+    const a: i32 = 42
+    const p: Path(i32, a, a) = refl(a)
+    const q: Path(i32, a, a) = <i> a
+    const r: (a = a) = p
+    const idT: Path(Type, i32, i32) = refl(i32)
+    var x: i32 = transport(idT, 42)
+    ret x
+end

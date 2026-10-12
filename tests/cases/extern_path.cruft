@@ -1,0 +1,3 @@
+package badffi
+
+extern fn witness(p: Path(i32, 0, 0)): i32

@@ -1,0 +1,16 @@
+package cols
+
+pub fn main(): i32
+    var label = "cruft"
+    var m: Map(i32, i32) = []
+    m.insert(1, 10)
+    m.insert(2, 20)
+    var hit: i32 = 0
+    if m.contains(2) then
+        hit = 1
+    end
+    print(label.length())
+    print(m.length())
+    print(hit)
+    ret 0
+end

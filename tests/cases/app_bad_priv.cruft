@@ -1,0 +1,7 @@
+package client
+
+import math
+
+pub fn main(): i32
+    ret math.secret()
+end

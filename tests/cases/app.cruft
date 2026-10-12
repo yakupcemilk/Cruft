@@ -1,0 +1,9 @@
+package app
+
+import math
+
+pub fn main(): i32
+    var n: i32 = math.add(math.answer, 1)
+    print(n)
+    ret 0
+end

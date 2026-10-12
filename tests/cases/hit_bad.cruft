@@ -1,0 +1,14 @@
+package badhit
+
+pub type Int
+    z
+    s(n: Int)
+    extra : Path(Int, z, s(z))
+end
+
+pub fn bad(n: Int): i32
+    ret match n
+        case z then 0
+        case s(k) then 1
+    end
+end
