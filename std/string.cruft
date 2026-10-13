@@ -1,0 +1,21 @@
+package string
+
+// String is a buffer {bytes, length, capacity, refcount}.
+// Literals point at static bytes (they are not freed). `alloc_string(n)`
+// asks the runtime for n+1 bytes through cruft_alloc and owns that block
+// until the value is dropped, which calls cruft_free.
+// `str` is the same type as String: a borrowed view is just a use that does
+// not move the owner. `.data()` stays valid while that value is alive.
+// `.length()` is the byte count as i32. `.byte_len()` is the full i64 count.
+
+pub fn len(s: str): i32
+    ret s.length()
+end
+
+pub fn byte_len(s: str): i64
+    ret s.byte_len()
+end
+
+pub fn bytes(s: str): ptr
+    ret s.data()
+end

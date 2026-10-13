@@ -1,0 +1,10 @@
+package app
+
+import alpha
+import beta
+
+pub fn main(): i32
+    print(alpha.add(2, 3))
+    print(beta.add(2, 3))
+    ret 0
+end

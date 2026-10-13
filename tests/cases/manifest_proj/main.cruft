@@ -1,0 +1,5 @@
+package app
+
+pub fn main(): i32
+    ret 0
+end

@@ -66,15 +66,28 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Compiler library + driver
+#
+#   src/lexer      scanner
+#   src/parser     recursive-descent parser
+#   src/ast        syntax tree
+#   src/sema       type checker, types, and definitional equality
+#   src/middle     proof erasure and arena optimisation
+#   src/codegen    LLVM lowering
+#   src/runtime    C runtime linked beside generated objects
 # ---------------------------------------------------------------------------
 add_library(cruft_frontend STATIC
-  src/AST.cpp
-  src/Lexer.cpp
-  src/Parser.cpp
-  src/Types.cpp
-  src/Normalizer.cpp
-  src/TypeChecker.cpp
-  src/CodeGen.cpp
+  src/ast/AST.cpp
+  src/lexer/Lexer.cpp
+  src/parser/Parser.cpp
+  src/sema/Types.cpp
+  src/sema/Normalizer.cpp
+  src/sema/TypeChecker.cpp
+  src/middle/ProofErasure.cpp
+  src/middle/ArenaOpt.cpp
+  src/codegen/CodeGen.cpp
+  src/Diagnostics.cpp
+  src/Manifest.cpp
+  src/ModuleLoader.cpp
 )
 target_include_directories(cruft_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_include_directories(cruft_frontend SYSTEM PUBLIC ${CRUFT_LLVM_INCLUDE_DIRS})

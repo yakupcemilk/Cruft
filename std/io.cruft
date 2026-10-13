@@ -1,0 +1,47 @@
+package io
+
+// Standard streams. `import io` loads std/io.cruft.
+// print and println write bytes to stdout. read_line takes one line from
+// stdin and returns it without the trailing newline. A closed stream or EOF
+// yields an empty String.
+
+extern fn cruft_stdout(): ptr
+extern fn cruft_stderr(): ptr
+extern fn cruft_stdin(): ptr
+extern fn cruft_io_write(data: ptr, len: i64, stream: ptr)
+extern fn cruft_read_line(buf: ptr, cap: i64): i64
+
+pub fn stdout(): ptr
+    ret cruft_stdout()
+end
+
+pub fn stderr(): ptr
+    ret cruft_stderr()
+end
+
+pub fn stdin(): ptr
+    ret cruft_stdin()
+end
+
+pub fn print(msg: str)
+    cruft_io_write(msg.data(), msg.byte_len(), stdout())
+end
+
+pub fn println(msg: str)
+    print(msg)
+    cruft_io_write("\n".data(), 1, stdout())
+end
+
+pub fn eprint(msg: str)
+    cruft_io_write(msg.data(), msg.byte_len(), stderr())
+end
+
+pub fn read_line(): String
+    var buf: String = alloc_string(4096)
+    var n: i64 = cruft_read_line(buf.data(), 4097)
+    if n < 0 then
+        ret ""
+    end
+    buf.set_len(n)
+    ret buf
+end

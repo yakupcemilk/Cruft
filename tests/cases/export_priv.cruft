@@ -1,0 +1,9 @@
+package bad
+
+import math
+
+export math.secret
+
+pub fn main(): i32
+    ret 0
+end

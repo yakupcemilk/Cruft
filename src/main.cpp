@@ -14,13 +14,19 @@
 // All input files are compiled as one compilation unit so that packages can
 // reference each other; the package name comes from `package <name>` inside
 // each file, never from the file name.
-#include "CodeGen.h"
+#include "codegen/CodeGen.h"
 #include "Diagnostics.h"
-#include "Lexer.h"
-#include "Parser.h"
-#include "TypeChecker.h"
+#include "lexer/Lexer.h"
+#include "Manifest.h"
+#include "ModuleLoader.h"
+#include "parser/Parser.h"
+#include "sema/TypeChecker.h"
+#include "middle/ArenaOpt.h"
+#include "middle/ProofErasure.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -33,11 +39,15 @@ enum class OutputKind { LLVMIR, Object, Assembly, CheckOnly };
 
 struct Options {
   std::vector<std::string> inputs;
+  std::vector<std::string> libPaths;
   std::string output;
   std::string target;
   std::string moduleName;
+  std::string manifest;
+  std::string cc;
   OutputKind kind = OutputKind::LLVMIR;
   unsigned optLevel = 0;
+  bool link = false;
 };
 
 void usage(std::ostream &os) {
@@ -48,8 +58,12 @@ void usage(std::ostream &os) {
         "  -S                 emit assembly (.s)\n"
         "  --check            type-check only\n"
         "  -O0 .. -O3         optimisation level (default -O0)\n"
-        "  --target <triple>  target triple (default: host)\n"
+        "  --target <triple>  target triple (default: host, or cruft.toml)\n"
         "  --module <name>    LLVM module name\n"
+        "  --manifest <path>  package manifest (default: cruft.toml beside the first input)\n"
+        "  --lib <dir>        directory searched for imported packages\n"
+        "  --link             link an executable (requires --cc)\n"
+        "  --cc <path>        C compiler used by --link\n"
         "  -h, --help         show this help\n";
 }
 
@@ -81,6 +95,23 @@ bool parseArgs(int argc, char **argv, Options &opts) {
       if (!v)
         return false;
       opts.moduleName = v;
+    } else if (a == "--manifest") {
+      const char *v = needValue("--manifest");
+      if (!v)
+        return false;
+      opts.manifest = v;
+    } else if (a == "--lib") {
+      const char *v = needValue("--lib");
+      if (!v)
+        return false;
+      opts.libPaths.emplace_back(v);
+    } else if (a == "--cc") {
+      const char *v = needValue("--cc");
+      if (!v)
+        return false;
+      opts.cc = v;
+    } else if (a == "--link") {
+      opts.link = true;
     } else if (a == "-emit-llvm") {
       opts.kind = OutputKind::LLVMIR;
     } else if (a == "-c") {
@@ -132,15 +163,92 @@ bool readFile(const std::string &path, std::string &out) {
 
 } // namespace
 
+namespace fs = std::filesystem;
+
+std::string findUp(const std::string &start, const fs::path &relative) {
+  std::error_code ec;
+  fs::path dir = fs::absolute(fs::path(start), ec).parent_path();
+  if (ec)
+    dir = fs::path(start).parent_path();
+  for (int i = 0; i < 8 && !dir.empty(); ++i) {
+    fs::path candidate = dir / relative;
+    if (fs::is_regular_file(candidate))
+      return candidate.string();
+    if (!dir.has_parent_path() || dir == dir.parent_path())
+      break;
+    dir = dir.parent_path();
+  }
+  return {};
+}
+
+bool linkExecutable(const Options &opts, const cruft::Manifest &manifest, const std::string &object,
+                    const std::string &output) {
+  if (opts.cc.empty()) {
+    std::cerr << "cruftc: --link requires --cc <compiler>\n";
+    return false;
+  }
+  std::vector<std::string> cmd = {opts.cc, object};
+  if (!opts.inputs.empty()) {
+    if (std::string arena = findUp(opts.inputs.front(), fs::path("src") / "runtime" / "arena.c");
+        !arena.empty())
+      cmd.push_back(std::move(arena));
+    if (std::string mem = findUp(opts.inputs.front(), fs::path("src") / "runtime" / "mem.c");
+        !mem.empty())
+      cmd.push_back(std::move(mem));
+    if (std::string fsrt = findUp(opts.inputs.front(), fs::path("src") / "runtime" / "fs.c");
+        !fsrt.empty())
+      cmd.push_back(std::move(fsrt));
+    if (std::string iort = findUp(opts.inputs.front(), fs::path("src") / "runtime" / "io.c");
+        !iort.empty())
+      cmd.push_back(std::move(iort));
+  }
+  cmd.push_back("-o");
+  cmd.push_back(output);
+  for (const std::string &dir : manifest.libraryPaths)
+    cmd.push_back("-L" + dir);
+  for (const std::string &lib : manifest.libraries)
+    cmd.push_back("-l" + lib);
+
+  std::string line;
+  for (size_t i = 0; i < cmd.size(); ++i) {
+    if (i)
+      line += ' ';
+    line += cmd[i];
+  }
+  int rc = std::system(line.c_str());
+  if (rc != 0) {
+    std::cerr << "cruftc: link failed (" << rc << "): " << line << '\n';
+    return false;
+  }
+  return true;
+}
+
 int main(int argc, char **argv) {
   Options opts;
   if (!parseArgs(argc, argv, opts)) {
     usage(std::cerr);
     return 2;
   }
+  if (opts.link && opts.cc.empty()) {
+    std::cerr << "cruftc: --link requires --cc <compiler>\n";
+    return 2;
+  }
 
   cruft::DiagnosticEngine diags;
   cruft::ast::Program program;
+  cruft::Manifest manifest;
+
+  std::string manifestPath = opts.manifest;
+  if (manifestPath.empty())
+    manifestPath = cruft::Manifest::discover(opts.inputs.front());
+  if (!manifestPath.empty()) {
+    if (!manifest.loadFile(manifestPath, diags)) {
+      diags.print(std::cerr);
+      return 1;
+    }
+  }
+  if (opts.target.empty())
+    opts.target = manifest.targetTriple;
 
   // ---- Lex + Parse every input ------------------------------------------
   for (const std::string &path : opts.inputs) {
@@ -154,7 +262,17 @@ int main(int argc, char **argv) {
     cruft::Parser parser(std::move(tokens), path, diags);
     program.files.push_back(parser.parseFile());
   }
-  if (diags.hasErrors()) {
+
+  cruft::ModuleLoader loader(diags, opts.libPaths);
+  for (const std::string &path : manifest.modulePaths)
+    loader.addSearchPath(path);
+  for (const std::string &dep : manifest.dependencies) {
+    if (!loader.loadDependency(dep, opts.inputs.front(), program)) {
+      diags.print(std::cerr);
+      return 1;
+    }
+  }
+  if (!loader.resolve(program) || diags.hasErrors()) {
     diags.print(std::cerr);
     return 1;
   }
@@ -177,15 +295,42 @@ int main(int argc, char **argv) {
         break;
       }
   }
+  cruft::mid::ProofErasure::run(program);
+  cruft::mid::ArenaOpt::run(program);
+
   cruft::CodeGenOptions cgOpts;
   cgOpts.targetTriple = opts.target;
   cgOpts.optLevel = opts.optLevel;
+  cgOpts.linkLibraries = manifest.libraries;
   cruft::CodeGen codegen(program, checker, diags, moduleName, cgOpts);
   if (!codegen.generate()) {
     diags.print(std::cerr);
     return 1;
   }
   codegen.optimize();
+
+  if (opts.link) {
+    std::string exe = opts.output;
+    if (exe.empty()) {
+      std::string base = opts.inputs.front();
+      size_t slash = base.find_last_of("/\\");
+      size_t dot = base.find_last_of('.');
+      if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        base = base.substr(0, dot);
+      exe = base;
+#ifdef _WIN32
+      exe += ".exe";
+#endif
+    }
+    std::string object = exe + ".o";
+    if (!codegen.writeObject(object)) {
+      diags.print(std::cerr);
+      return 1;
+    }
+    if (!linkExecutable(opts, manifest, object, exe))
+      return 1;
+    return 0;
+  }
 
   std::string output = opts.output.empty() ? defaultOutput(opts) : opts.output;
   bool written = false;

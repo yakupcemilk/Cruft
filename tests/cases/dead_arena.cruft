@@ -1,0 +1,9 @@
+package deadarena
+
+pub fn main(): i32
+    scope arena
+        var x: i32 = 1 + 2
+        print(x)
+    end
+    ret 0
+end

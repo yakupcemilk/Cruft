@@ -1,0 +1,11 @@
+package recover
+
+pub fn broken(): i32
+    var x: i32 = $$$
+    ret 1
+end
+
+pub fn second(): i32
+    var y: i32 =
+    ret 2
+end

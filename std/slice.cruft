@@ -1,0 +1,18 @@
+package slice
+
+// Slice(T) is {ptr, i64}: a non-owning view. `.length()` is the element
+// count. `.at(i)` checks 0 <= i < length and traps through cruft_bounds_fail
+// otherwise. The address passed to from_raw is an integer, the same ABI as
+// mem.allocate.
+
+pub fn from_raw(addr: i64, n: i64): Slice(i32)
+    ret raw_slice(addr, n)
+end
+
+pub fn len(s: Slice(i32)): i64
+    ret s.length()
+end
+
+pub fn at(s: Slice(i32), i: i64): i32
+    ret s.at(i)
+end

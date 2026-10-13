@@ -1,0 +1,8 @@
+package app
+
+use math.add
+
+pub fn main(): i32
+    print(add(2, 3))
+    ret 0
+end

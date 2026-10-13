@@ -20,6 +20,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 CASES = ROOT / "cases"
 FFI_C = ROOT / "ffi" / "c_add.c"
+ARENA_C = ROOT.parent / "src" / "runtime" / "arena.c"
+MEM_C = ROOT.parent / "src" / "runtime" / "mem.c"
+FS_C = ROOT.parent / "src" / "runtime" / "fs.c"
+IO_C = ROOT.parent / "src" / "runtime" / "io.c"
 
 
 class Fail(Exception):
@@ -253,7 +257,7 @@ def main() -> int:
         obj = out / f"{name}.o"
         exe = out / (f"{name}.exe" if os.name == "nt" else name)
         expect_ok([cruftc, "-c", "-o", str(obj), str(source)], f"{name} object")
-        expect_ok([cc, str(obj), "-o", str(exe)], f"link {name}")
+        expect_ok([cc, str(obj), str(ARENA_C), str(MEM_C), "-o", str(exe)], f"link {name}")
         result = expect_ok([str(exe)], f"run {name}")
         text = result.stdout or ""
         for needle in needles:
@@ -267,17 +271,162 @@ def main() -> int:
         [cruftc, "-emit-llvm", "-o", str(ergo_ll), str(CASES / "ergonomics.cruft")],
         "ergonomics ir",
     )
-    ir_has(ergo_ll, "alloca [8192 x i8]", "arena: stack bump buffer")
+    ir_has(ergo_ll, "call void @cruft_arena_push()", "arena: save bump watermark")
+    ir_has(ergo_ll, "call void @cruft_arena_pop()", "arena: restore bump watermark")
+    ir_has(ergo_ll, "call ptr @cruft_arena_alloc(", "arena: bump allocation")
+
+    ret_ll = out / "arena_return.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(ret_ll), str(CASES / "arena_return.cruft")],
+        "arena return ir",
+    )
+    ret_ir = ret_ll.read_text(encoding="utf-8", errors="replace")
+    push_at = ret_ir.find("call void @cruft_arena_push()")
+    pop_at = ret_ir.find("call void @cruft_arena_pop()")
+    ret_at = ret_ir.find("ret i32")
+    if not (0 <= push_at < pop_at < ret_at):
+        raise Fail(
+            "arena return: expected push, then pop, then ret on the early-exit path\n"
+            f"--- IR ---\n{ret_ir}"
+        )
     ir_has(ergo_ll, "define internal i32 @lambda.", "filter/map lambda")
     ir_lacks(ergo_ll, "Path(", "lifetimes erased")
     ir_lacks(ergo_ll, "::", "no colon-colon in IR")
     ok("scope arena + filter/map pipeline")
+
+    link_and_run("arena_return", CASES / "arena_return.cruft", "60")
+    ok("scope arena pop runs before ret")
 
     link_and_run("shared", CASES / "shared_vec.cruft", "6", "3")
     ok("shared vectors are reference counted")
 
     link_and_run("collections", CASES / "collections.cruft", "5", "2", "1")
     ok("String.length and Map.insert/contains")
+
+    # ------------------------------------------------------------------
+    # 6. Recovery, modules on disk, mangling, slices, manifest.
+    # ------------------------------------------------------------------
+    recover = expect_fail(
+        [cruftc, "--check", str(CASES / "recover.cruft")],
+        "unexpected character",
+        "parser recovery",
+    )
+    blob = (recover.stdout or "") + (recover.stderr or "")
+    if "^" not in blob or " | " not in blob:
+        raise Fail(f"parser recovery: diagnostic is missing a source snippet\n{blob}")
+    if "cascading" not in blob:
+        raise Fail(f"parser recovery: expected cascade suppression\n{blob}")
+    if "expected an expression" not in blob:
+        raise Fail(f"parser recovery: did not resume after the first fault\n{blob}")
+    ok("panic-mode recovery with snippets")
+
+    dead_ll = out / "dead_arena.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(dead_ll), str(CASES / "dead_arena.cruft")],
+        "dead arena ir",
+    )
+    ir_lacks(dead_ll, "cruft_arena_push", "dead arena is deleted")
+    link_and_run("dead_arena", CASES / "dead_arena.cruft", "3")
+    ok("empty scope arena is erased")
+
+    link_and_run("slice_len", CASES / "slice_len.cruft", "4")
+    ok("Slice(T) length")
+
+    link_and_run("use_add", CASES / "use_add.cruft", "5")
+    ok("use opens an imported symbol and loads the package")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "export_priv.cruft")],
+        "private to package",
+        "export pri",
+    )
+    ok("export rejects pri symbols")
+
+    link_and_run("modtree", CASES / "modtree" / "app.cruft", "7")
+    ok("import resolves a sibling .cruft file")
+
+    link_and_run("exmod", CASES / "exmod" / "app.cruft", "42")
+    ok("export re-exports a public symbol")
+
+    lib_obj = out / "libuser.o"
+    lib_exe = out / ("libuser.exe" if os.name == "nt" else "libuser")
+    expect_ok(
+        [cruftc, "-c", "-o", str(lib_obj), "--lib", str(CASES / "libdep"),
+         str(CASES / "libuser" / "app.cruft")],
+        "lib search object",
+    )
+    expect_ok([cc, str(lib_obj), str(ARENA_C), "-o", str(lib_exe)], "link libuser")
+    lib_run = expect_ok([str(lib_exe)], "run libuser")
+    if "9" not in (lib_run.stdout or ""):
+        raise Fail(f"libuser: expected 9, got {lib_run.stdout!r}")
+    ok("--lib resolves a package outside the source directory")
+
+    collide_ll = out / "collide.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(collide_ll), str(CASES / "collide" / "app.cruft")],
+        "collide ir",
+    )
+    ir_has(collide_ll, "@_C_alpha_alpha_add(", "pub alpha.add is mangled")
+    ir_has(collide_ll, "@_C_beta_beta_add(", "pub beta.add is mangled")
+    ir_lacks(collide_ll, "define i32 @add(", "colliding pub names are not both unmangled")
+    ir_has(collide_ll, "@main(", "entry point stays unmangled")
+    collide_obj = out / "collide.o"
+    collide_exe = out / ("collide.exe" if os.name == "nt" else "collide")
+    expect_ok([cruftc, "-c", "-o", str(collide_obj), str(CASES / "collide" / "app.cruft")], "collide object")
+    expect_ok([cc, str(collide_obj), str(ARENA_C), "-o", str(collide_exe)], "link collide")
+    collide_run = expect_ok([str(collide_exe)], "run collide")
+    collide_out = collide_run.stdout or ""
+    if "5" not in collide_out or "6" not in collide_out:
+        raise Fail(f"collide: expected 5 and 6, got {collide_out!r}")
+    ok("colliding pub symbols use _C_ package module symbol names")
+
+    std_obj = out / "usestd.o"
+    std_exe = out / ("usestd.exe" if os.name == "nt" else "usestd")
+    expect_ok([cruftc, "-c", "-o", str(std_obj), str(CASES / "usestd" / "app.cruft")], "std object")
+    expect_ok([cc, str(std_obj), str(MEM_C), "-o", str(std_exe)], "link std")
+    std_run = expect_ok([str(std_exe)], "run std")
+    if "4" not in (std_run.stdout or ""):
+        raise Fail(f"usestd: expected 4, got {std_run.stdout!r}")
+    ok("std mem and slice packages")
+
+    expect_fail(
+        [cruftc, "-emit-llvm", "-o", str(out / "manifest.ll"), str(CASES / "manifest_proj" / "main.cruft")],
+        "unknown target",
+        "manifest triple",
+    )
+    ok("cruft.toml target triple is applied")
+
+    # ------------------------------------------------------------------
+    # 7. std fs / io, and bounds-checked slice indexing.
+    # ------------------------------------------------------------------
+    fs_obj = out / "std_fs.o"
+    fs_exe = out / ("std_fs.exe" if os.name == "nt" else "std_fs")
+    expect_ok([cruftc, "-c", "-o", str(fs_obj), str(CASES / "std_fs.cruft")], "std fs object")
+    expect_ok(
+        [cc, str(fs_obj), str(MEM_C), str(FS_C), str(IO_C), "-o", str(fs_exe)],
+        "link std fs",
+    )
+    fs_run = expect_ok([str(fs_exe)], "run std fs")
+    if "hello" not in (fs_run.stdout or ""):
+        raise Fail(f"std fs: expected hello, got {fs_run.stdout!r}")
+    leftover = Path.cwd() / "cruft_std_io.txt"
+    if leftover.exists():
+        leftover.unlink()
+    ok("std fs read_to_string / write_file / exists and io.println")
+
+    line_obj = out / "read_line.o"
+    line_exe = out / ("read_line.exe" if os.name == "nt" else "read_line")
+    expect_ok([cruftc, "-c", "-o", str(line_obj), str(CASES / "read_line.cruft")], "read_line object")
+    expect_ok([cc, str(line_obj), str(MEM_C), str(IO_C), "-o", str(line_exe)], "link read_line")
+    line_run = run([str(line_exe)], input="hello\n")
+    if line_run.returncode != 0:
+        raise Fail(f"read_line: command failed ({line_run.returncode})\n{line_run.stderr}")
+    if "hello" not in (line_run.stdout or ""):
+        raise Fail(f"read_line: expected hello, got {line_run.stdout!r}")
+    ok("io.read_line strips the newline")
+
+    link_and_run("slice_at", CASES / "slice_at.cruft", "5", "3", "4")
+    ok("Slice.at and Vector.at bounds-checked indexing")
 
     print(f"\n{passed} tests passed")
     return 0

@@ -1,0 +1,8 @@
+package app
+
+import extra
+
+pub fn main(): i32
+    print(extra.value)
+    ret 0
+end
