@@ -1,0 +1,7 @@
+package slices
+
+pub fn main(): i32
+    var s: Slice(i32) = raw_slice(0, 4)
+    print(s.length())
+    ret 0
+end

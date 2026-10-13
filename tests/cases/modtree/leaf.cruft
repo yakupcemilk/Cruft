@@ -1,0 +1,3 @@
+package leaf
+
+pub const value: i32 = 7

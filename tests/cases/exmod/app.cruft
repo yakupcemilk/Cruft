@@ -1,0 +1,8 @@
+package app
+
+import wrap
+
+pub fn main(): i32
+    print(wrap.add(20, 22))
+    ret 0
+end

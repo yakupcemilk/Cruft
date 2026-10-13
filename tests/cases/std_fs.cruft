@@ -1,0 +1,15 @@
+package app
+
+import fs
+import io
+
+pub fn main(): i32
+    if not fs.write_file("cruft_std_io.txt", "hello") then
+        ret 1
+    end
+    if not fs.exists("cruft_std_io.txt") then
+        ret 2
+    end
+    io.println(fs.read_to_string("cruft_std_io.txt"))
+    ret 0
+end

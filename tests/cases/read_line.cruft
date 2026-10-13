@@ -1,0 +1,9 @@
+package app
+
+import io
+
+pub fn main(): i32
+    var line: str = io.read_line()
+    io.println(line)
+    ret 0
+end

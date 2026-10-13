@@ -1,34 +1,142 @@
+// Lexer.h - tokenizer for Cruft source text.
 #pragma once
-#include "Token.h"
+
+#include "Diagnostics.h"
+
+#include <cstdint>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cruft {
 
+enum class TokenKind {
+  // ---- keywords -------------------------------------------------------
+  KwPackage,
+  KwModule, ///< optional `module <name>` after `package`
+  KwImport,
+  KwExport, ///< `export pkg.name` re-exports a public symbol
+  KwUse,    ///< `use pkg.name` imports and opens one public symbol
+  KwPub,
+  KwPri,
+  KwFn,
+  KwExtern,
+  KwVar,
+  KwConst,
+  KwRet,
+  KwEnd,
+  KwIf,
+  KwThen,
+  KwElse,
+  KwWhile,
+  KwDo,
+  KwType,
+  KwMatch,
+  KwCase,
+  KwAnd,
+  KwOr,
+  KwNot,
+  KwTrue,
+  KwFalse,
+  KwScope,  ///< `scope arena` — lexical bump region
+  KwArena,
+  KwOwned,  ///< explicit (and default) linear ownership
+  KwShared, ///< reference-counted multi-ownership
+
+  // primitive / built-in type names (lexed as keywords so the parser can
+  // tell type positions from identifiers without a symbol table)
+  KwI32,
+  KwI64,
+  KwF32,
+  KwF64,
+  KwBool,
+  KwPtr,      ///< `ptr`  - untyped C pointer
+  KwInterval, ///< `I`     - the cubical interval
+  KwUniverse, ///< `Type`  - universe of (small) types
+  KwPath,     ///< `Path`
+  KwEquiv,    ///< `Equiv`
+  KwI0,       ///< `i0`
+  KwI1,       ///< `i1`
+
+  // ---- literals -------------------------------------------------------
+  Identifier,
+  IntLiteral,
+  FloatLiteral,
+  StringLiteral,
+
+  // ---- punctuation / operators ---------------------------------------
+  LParen,
+  RParen,
+  LBracket,
+  RBracket,
+  Comma,
+  Colon,
+  Dot,
+  Assign,       ///< =
+  Plus,
+  Minus,
+  Star,
+  Slash,
+  Percent,
+  EqEq,         ///< ==
+  BangEq,       ///< !=
+  Less,         ///< <   (also opens a path abstraction `<i> e`)
+  LessEq,
+  Greater,      ///< >
+  GreaterEq,
+  At,           ///< @   path application
+  Tilde,        ///< ~   interval reversal
+  Meet,         ///< /\  interval min
+  Join,         ///< \/  interval max
+  Arrow,        ///< ->  face mapping
+  FatArrow,     ///< =>  lambda body
+  Semicolon,    ///< `;` optional statement terminator, also a recovery boundary
+  LBrace,       ///< `{` recovery boundary
+  RBrace,       ///< `}` recovery boundary
+
+  EndOfFile,
+  Invalid
+};
+
+std::string_view tokenKindName(TokenKind k);
+
+struct Token {
+  TokenKind kind = TokenKind::Invalid;
+  std::string text; ///< lexeme (for literals/identifiers)
+  SourceLocation loc;
+
+  [[nodiscard]] bool is(TokenKind k) const { return kind == k; }
+};
+
 class Lexer {
 public:
-    explicit Lexer(const std::string& source);
+  Lexer(std::string source, std::string filename, DiagnosticEngine &diags);
 
-    Token nextToken();
-    std::vector<Token> getTokens() {
-        return tokenize();
-    }
+  /// Tokenizes the whole file. Always ends with an EndOfFile token.
+  std::vector<Token> tokenize();
 
 private:
-    std::string input;
-    size_t pos = 0;
-    int line = 1;
+  [[nodiscard]] bool atEnd() const { return pos_ >= src_.size(); }
+  [[nodiscard]] char peek(size_t ahead = 0) const {
+    return pos_ + ahead < src_.size() ? src_[pos_ + ahead] : '\0';
+  }
+  char advance();
+  [[nodiscard]] SourceLocation here() const;
 
-    void advance();
-    bool matchNext(char expected) const;
-    void skipWhitespace();
-    void skipBlockComment();
+  void skipTrivia();
+  Token lexIdentifierOrKeyword();
+  Token lexNumber();
+  Token lexString();
+  Token make(TokenKind k, std::string text, SourceLocation loc) const;
 
-    Token lexLineComment();
-    Token lexIdentifierOrKeyword();
-    Token lexNumber();
-    Token lexString();
-    std::vector<Token> tokenize();
+  std::string src_;
+  std::shared_ptr<const std::string> file_;
+  DiagnosticEngine &diags_;
+  size_t pos_ = 0;
+  unsigned line_ = 1;
+  unsigned column_ = 1;
+  bool junkRun_ = false; ///< consecutive unexpected characters share one diagnostic
 };
 
 } // namespace cruft

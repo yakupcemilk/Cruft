@@ -1,0 +1,12 @@
+package app
+
+import mem
+import slice
+
+pub fn main(): i32
+    var p: i64 = mem.allocate(16)
+    var s: Slice(i32) = slice.from_raw(p, 4)
+    print(s.length())
+    mem.release(p)
+    ret 0
+end

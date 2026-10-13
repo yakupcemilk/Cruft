@@ -5,7 +5,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace cruft {
@@ -33,48 +33,43 @@ struct Diagnostic {
 
 /// Collects diagnostics for the whole pipeline. Phases never throw for user
 /// errors; they report here and the driver decides whether to continue.
+///
+/// Panic mode (parser recovery) suppresses every diagnostic that follows the
+/// root fault until `endPanic()`, so one bad token does not flood the user
+/// with cascading errors. `print` renders a source snippet and a caret.
 class DiagnosticEngine {
 public:
-  void report(Severity sev, SourceLocation loc, std::string msg) {
-    if (sev == Severity::Error)
-      ++errorCount_;
-    diags_.push_back({sev, std::move(loc), std::move(msg)});
-  }
-  void error(SourceLocation loc, std::string msg) {
-    report(Severity::Error, std::move(loc), std::move(msg));
-  }
-  void warning(SourceLocation loc, std::string msg) {
-    report(Severity::Warning, std::move(loc), std::move(msg));
-  }
-  void note(SourceLocation loc, std::string msg) {
-    report(Severity::Note, std::move(loc), std::move(msg));
-  }
+  void registerSource(const std::string &filename, std::string source);
+
+  void report(Severity sev, SourceLocation loc, std::string msg);
+  void error(SourceLocation loc, std::string msg);
+  void warning(SourceLocation loc, std::string msg);
+  void note(SourceLocation loc, std::string msg);
+
+  /// Drop further diagnostics until `endPanic`. The root error is reported
+  /// by the caller before entering panic mode.
+  void beginPanic();
+  void endPanic();
+  [[nodiscard]] bool inPanic() const { return panic_; }
+
+  /// Count a diagnostic that was deliberately not emitted (lexer junk runs).
+  void noteSuppressed() { ++suppressed_; }
 
   [[nodiscard]] bool hasErrors() const { return errorCount_ > 0; }
   [[nodiscard]] unsigned errorCount() const { return errorCount_; }
+  [[nodiscard]] unsigned suppressedCount() const { return suppressed_; }
   [[nodiscard]] const std::vector<Diagnostic> &all() const { return diags_; }
 
-  void print(std::ostream &os) const {
-    for (const auto &d : diags_) {
-      os << d.loc.str() << ": ";
-      switch (d.severity) {
-      case Severity::Note:
-        os << "note: ";
-        break;
-      case Severity::Warning:
-        os << "warning: ";
-        break;
-      case Severity::Error:
-        os << "error: ";
-        break;
-      }
-      os << d.message << '\n';
-    }
-  }
+  void print(std::ostream &os) const;
 
 private:
+  void printSnippet(std::ostream &os, const SourceLocation &loc) const;
+
   std::vector<Diagnostic> diags_;
+  std::unordered_map<std::string, std::string> sources_;
   unsigned errorCount_ = 0;
+  unsigned suppressed_ = 0;
+  bool panic_ = false;
 };
 
 } // namespace cruft

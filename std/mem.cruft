@@ -1,0 +1,19 @@
+package mem
+
+// Public names are C symbols. `allocate` / `release` avoid libc `alloc` / `free`.
+
+pub extern fn cruft_alloc(nbytes: i64): i64
+pub extern fn cruft_free(addr: i64)
+pub extern fn cruft_realloc(addr: i64, nbytes: i64): i64
+
+pub fn allocate(nbytes: i64): i64
+    ret cruft_alloc(nbytes)
+end
+
+pub fn release(addr: i64)
+    cruft_free(addr)
+end
+
+pub fn resize(addr: i64, nbytes: i64): i64
+    ret cruft_realloc(addr, nbytes)
+end

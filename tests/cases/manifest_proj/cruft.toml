@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version = "0.1.0"
+
+[target]
+triple = "cruft-unknown-not-a-triple"
+
+[link]
+libraries = ["raylib"]
+search_paths = ["third_party/lib"]
+
+[modules]
+paths = ["."]

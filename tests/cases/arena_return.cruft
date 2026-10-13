@@ -1,0 +1,9 @@
+package demo
+
+pub fn main(): i32
+    scope arena
+        var temp = [10, 20, 30]
+        print(temp.sum())
+        ret 0
+    end
+end

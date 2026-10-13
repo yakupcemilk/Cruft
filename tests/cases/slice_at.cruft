@@ -1,0 +1,10 @@
+package demo
+
+pub fn main(): i32
+    var xs: Vector(i32) = [4, 5, 6]
+    var s: Slice(i32) = raw_slice(xs.data().addr(), 3)
+    print(s.at(1))
+    print(s.length())
+    print(xs.at(0))
+    ret 0
+end

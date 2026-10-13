@@ -1,0 +1,69 @@
+package fs
+
+// Filesystem module. The loader finds this file as std/fs.cruft when a
+// program `import fs`. Package names are a single identifier, same as `mem`.
+//
+// The externs are a fixed-width C ABI over fopen, fread, fwrite, fseek,
+// ftell and fclose. Offsets are i64 so LLP64 `long` does not truncate a
+// file past 2 GiB. `ptr` is an untyped C pointer; `null()` is the null pointer.
+// String literals and `alloc_string` are NUL-terminated, so `.data()` is a
+// C string for as long as the String value is alive.
+
+extern fn cruft_fopen(path: ptr, mode: ptr): ptr
+extern fn cruft_fread(buf: ptr, size: i64, count: i64, stream: ptr): i64
+extern fn cruft_fwrite(buf: ptr, size: i64, count: i64, stream: ptr): i64
+extern fn cruft_fseek(stream: ptr, offset: i64, whence: i32): i32
+extern fn cruft_ftell(stream: ptr): i64
+extern fn cruft_fclose(stream: ptr): i32
+extern fn cruft_exists(path: ptr): i32
+
+pub fn exists(path: str): bool
+    ret cruft_exists(path.data()) != 0
+end
+
+pub fn write_file(path: str, content: str): bool
+    var file: ptr = cruft_fopen(path.data(), "wb".data())
+    if file == null() then
+        ret false
+    end
+    var n: i64 = content.byte_len()
+    var got: i64 = cruft_fwrite(content.data(), 1, n, file)
+    var closed: i32 = cruft_fclose(file)
+    if closed != 0 then
+        ret false
+    end
+    ret got == n
+end
+
+pub fn read_to_string(path: str): String
+    var file: ptr = cruft_fopen(path.data(), "rb".data())
+    if file == null() then
+        ret ""
+    end
+    var end_rc: i32 = cruft_fseek(file, 0, 2)
+    if end_rc != 0 then
+        var closed: i32 = cruft_fclose(file)
+        ret ""
+    end
+    var n: i64 = cruft_ftell(file)
+    if n < 0 then
+        var closed: i32 = cruft_fclose(file)
+        ret ""
+    end
+    var set_rc: i32 = cruft_fseek(file, 0, 0)
+    if set_rc != 0 then
+        var closed: i32 = cruft_fclose(file)
+        ret ""
+    end
+    var buf: String = alloc_string(n)
+    if n > 0 and buf.data() == null() then
+        var closed: i32 = cruft_fclose(file)
+        ret ""
+    end
+    var got: i64 = cruft_fread(buf.data(), 1, n, file)
+    var closed: i32 = cruft_fclose(file)
+    if got != n then
+        ret ""
+    end
+    ret buf
+end
