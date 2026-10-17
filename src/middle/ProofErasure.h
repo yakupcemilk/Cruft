@@ -8,6 +8,7 @@
 #pragma once
 
 #include "ast/AST.h"
+#include "sema/Normalizer.h"
 
 namespace cruft::mid {
 
@@ -16,8 +17,12 @@ public:
   static void run(ast::Program &program);
 
 private:
-  static void eraseBlock(ast::Block &block);
-  static void eraseExpr(ast::ExprPtr &expr);
+  static void eraseBlock(ast::Block &block, sema::Normalizer &norm);
+  static void eraseExpr(ast::ExprPtr &expr, sema::Normalizer &norm);
+  static void substBlock(ast::Block &block, const sema::Symbol *var, const ast::Expr &with,
+                         sema::Normalizer &norm);
+  static void substExpr(ast::ExprPtr &expr, const sema::Symbol *var, const ast::Expr &with,
+                        sema::Normalizer &norm);
 };
 
 } // namespace cruft::mid

@@ -1,0 +1,15 @@
+package tlin
+
+pri fn id(x: i32): i32
+    ret x
+end
+
+pri fn idsec(b: i32): Path(i32, id(id(b)), b)
+    ret refl(b)
+end
+
+pub fn moved(lin x: i32): i32
+    const e: Equiv(i32, i32) = iso(id, id, idsec, idsec)
+    const p: Path(Type, i32, i32) = ua(e)
+    ret transport(p, x)
+end

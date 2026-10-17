@@ -1,0 +1,8 @@
+package linbranch
+
+pub fn bad(lin x: i32, c: bool): i32
+    if c then
+        var y: i32 = x
+    end
+    ret x
+end

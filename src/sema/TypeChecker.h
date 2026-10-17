@@ -86,6 +86,31 @@ private:
   void checkStmt(ast::Stmt &stmt);
   [[nodiscard]] static bool blockAlwaysReturns(const ast::Block &block);
 
+  struct EffectRow {
+    ast::EffectSet bits = 0;
+    std::string var;
+    bool declared = false;
+  };
+  [[nodiscard]] ast::Usage resolveUsage(ast::Usage annotated, const Type &type, bool shared,
+                                        bool isConst) const;
+  void noteEffect(const Type &callee, const Symbol *sym, const SourceLocation &loc);
+  void rejectBoundary(const ast::Expr &arg, bool boundary, const SourceLocation &loc,
+                      const std::string &what);
+  [[nodiscard]] bool effectsCompatible(const Type &actual, const Type &expected) const;
+  TypePtr instantiateEffects(const TypePtr &type, const std::string &var, ast::EffectSet bits) const;
+  void joinUses(const std::set<const Symbol *> &saved, const std::set<const Symbol *> &thenSet,
+                const std::set<const Symbol *> &elseSet, bool thenDiv, bool elseDiv, bool hasElse,
+                const SourceLocation &loc);
+  void exhaustScope(size_t scopeIndex, const SourceLocation &loc);
+  void exhaustInScope(const SourceLocation &loc);
+  [[nodiscard]] std::set<const Symbol *> symbolsInScope() const;
+  void checkIndexResidues(const ast::Block &block, const std::vector<const Symbol *> &indices);
+  void verifyCofn(ast::FnDecl &fn);
+  bool cofnTerminates(ast::Block &block, const Symbol *self);
+  void rejectUntailCalls(const ast::Block &block, const Symbol *self);
+  [[nodiscard]] bool isFixedSize(const Type &type, std::set<const Symbol *> &seen) const;
+  void checkAlong(ast::CallExpr &call, const Type &fnType);
+
   // ---- expressions ----
   /// Checks `e` (possibly replacing the node) and returns its type.
   TypePtr checkExpr(ast::ExprPtr &e, const Type *expected = nullptr);
@@ -149,6 +174,7 @@ private:
   int currentRegion_ = 0;
   std::set<const Symbol *> moved_;
   bool consume_ = true; ///< false while checking a borrowed method receiver
+  std::vector<EffectRow> effectStack_;
 };
 
 } // namespace cruft::sema

@@ -40,6 +40,9 @@ enum class TypeKind {
   Map,       ///< Map(K, V)
   String,    ///< String
   Slice,     ///< Slice(T) — non-owning pointer + length
+  Labeled,   ///< Secret(T) or Private(T); payload is `elem`, label is `secrecy`
+  Leak,      ///< erased witness that a label may fall (no constructors)
+  Quotient,  ///< Quotient(T, rel, canon); runtime representation is the carrier
   Error      ///< poisoned type after a diagnostic
 };
 
@@ -57,7 +60,18 @@ struct Type {
   // return type may depend on the parameter (e.g. `fn sec(b: B): Path(B, f(g(b)), b)`).
   std::vector<TypePtr> params;
   std::vector<const Symbol *> paramSymbols;
+  std::vector<ast::Usage> paramUse;
   TypePtr ret;
+  ast::EffectSet effects = 0;
+  std::string effectVar;
+  bool effectsDeclared = false;
+
+  /// Labeled payload label, or the source label of a Leak.
+  ast::Secrecy secrecy = ast::Secrecy::Public;
+  /// Target label of a Leak.
+  ast::Secrecy secrecyTo = ast::Secrecy::Public;
+  /// Named canon function of a quotient. The relation itself is erased.
+  const Symbol *canonFn = nullptr;
 
   // Inductive
   const Symbol *inductive = nullptr;
@@ -81,7 +95,13 @@ struct Type {
   static TypePtr path(TypePtr elem, ast::ExprPtr lhs, ast::ExprPtr rhs);
   static TypePtr equiv(TypePtr a, TypePtr b);
   static TypePtr fn(std::vector<TypePtr> params, std::vector<const Symbol *> paramSymbols,
-                    TypePtr ret);
+                    TypePtr ret, std::vector<ast::Usage> paramUse = {},
+                    ast::EffectSet effects = 0, std::string effectVar = {},
+                    bool effectsDeclared = false);
+  static TypePtr labeled(TypePtr elem, ast::Secrecy secrecy);
+  static TypePtr leak(ast::Secrecy from, ast::Secrecy to);
+  static TypePtr quotient(TypePtr carrier, ast::ExprPtr rel, ast::ExprPtr canon,
+                          const Symbol *canonFn);
   static TypePtr inductiveOf(const Symbol *sym);
   static TypePtr vector(TypePtr elem, int region);
   static TypePtr map(TypePtr key, TypePtr val, int region);
@@ -97,16 +117,27 @@ struct Type {
   /// Types with no computational content; CodeGen erases every value of these.
   [[nodiscard]] bool isErased() const {
     return kind == TypeKind::Interval || kind == TypeKind::Universe || kind == TypeKind::Path ||
-           kind == TypeKind::Equiv;
+           kind == TypeKind::Equiv || kind == TypeKind::Leak;
+  }
+  [[nodiscard]] ast::Secrecy label() const {
+    return kind == TypeKind::Labeled ? secrecy : ast::Secrecy::Public;
   }
   /// Types that may legally cross a C ABI boundary (extern fn signatures).
   [[nodiscard]] bool isCCompatible() const;
   /// Buffers with an owner. Primitives stay copyable so arithmetic code is unchanged.
   [[nodiscard]] bool isStorage() const {
+    if (kind == TypeKind::Labeled && elem)
+      return elem->isStorage();
     return kind == TypeKind::Vector || kind == TypeKind::Map || kind == TypeKind::String;
   }
   /// Storage, plus non-owning slices whose data still dies with a region.
-  [[nodiscard]] bool isRegionBound() const { return isStorage() || kind == TypeKind::Slice; }
+  [[nodiscard]] bool isRegionBound() const {
+    if (kind == TypeKind::Labeled && elem)
+      return elem->isRegionBound();
+    if (kind == TypeKind::Quotient && elem)
+      return elem->isRegionBound();
+    return isStorage() || kind == TypeKind::Slice;
+  }
 
   [[nodiscard]] std::string str() const;
 };
@@ -118,8 +149,9 @@ enum class SymbolKind {
   Param,       ///< function parameter
   Type,        ///< (higher) inductive type
   Ctor,        ///< constructor of an inductive type
-  IntervalVar, ///< binder introduced by `<i>`
-  PatternVar   ///< binder introduced by a `case` pattern
+  IntervalVar, ///< binder introduced by `<i>` or `foreach i in I`
+  PatternVar,  ///< binder introduced by a `case` pattern
+  Axiom        ///< erased `axiom` inhabiting `Leak`
 };
 
 struct Symbol {
@@ -133,6 +165,7 @@ struct Symbol {
   bool isConst = false;
   bool isExtern = false;
   bool shared = false; ///< reference-counted binding (`shared var`)
+  ast::Usage usage = ast::Usage::Many;
 
   // Declaration back-links (whichever applies).
   const ast::FnDecl *fnDecl = nullptr;

@@ -1,0 +1,20 @@
+package linok
+
+pub fn keep(lin x: i32): i32
+    const p: Path(i32, x, x) = refl(x)
+    ret x
+end
+
+pub fn pick(lin x: i32, c: bool): i32
+    if c then
+        ret x
+    else
+        ret x
+    end
+end
+
+pub fn main(): i32
+    print(keep(4))
+    print(pick(5, true))
+    ret 0
+end

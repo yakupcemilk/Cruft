@@ -25,7 +25,10 @@ const std::unordered_map<std::string_view, TokenKind> &keywordTable() {
       {"not", TokenKind::KwNot},         {"true", TokenKind::KwTrue},
       {"false", TokenKind::KwFalse},     {"scope", TokenKind::KwScope},
       {"arena", TokenKind::KwArena},     {"owned", TokenKind::KwOwned},
-      {"shared", TokenKind::KwShared},   {"i32", TokenKind::KwI32},
+      {"shared", TokenKind::KwShared},   {"lin", TokenKind::KwLin},
+      {"aff", TokenKind::KwAff},         {"foreach", TokenKind::KwForeach},
+      {"cofn", TokenKind::KwCofn},       {"along", TokenKind::KwAlong},
+      {"axiom", TokenKind::KwAxiom},     {"i32", TokenKind::KwI32},
       {"i64", TokenKind::KwI64},         {"f32", TokenKind::KwF32},
       {"f64", TokenKind::KwF64},         {"bool", TokenKind::KwBool},
       {"ptr", TokenKind::KwPtr},
@@ -70,6 +73,12 @@ std::string_view tokenKindName(TokenKind k) {
   case TokenKind::KwArena: return "'arena'";
   case TokenKind::KwOwned: return "'owned'";
   case TokenKind::KwShared: return "'shared'";
+  case TokenKind::KwLin: return "'lin'";
+  case TokenKind::KwAff: return "'aff'";
+  case TokenKind::KwForeach: return "'foreach'";
+  case TokenKind::KwCofn: return "'cofn'";
+  case TokenKind::KwAlong: return "'along'";
+  case TokenKind::KwAxiom: return "'axiom'";
   case TokenKind::KwI32: return "'i32'";
   case TokenKind::KwI64: return "'i64'";
   case TokenKind::KwF32: return "'f32'";
@@ -101,6 +110,7 @@ std::string_view tokenKindName(TokenKind k) {
   case TokenKind::Percent: return "'%'";
   case TokenKind::EqEq: return "'=='";
   case TokenKind::BangEq: return "'!='";
+  case TokenKind::Bang: return "'!'";
   case TokenKind::Less: return "'<'";
   case TokenKind::LessEq: return "'<='";
   case TokenKind::Greater: return "'>'";
@@ -325,7 +335,7 @@ std::vector<Token> Lexer::tokenize() {
     case '/': kind = two('\\', TokenKind::Meet, TokenKind::Slash); break;
     case '\\': kind = two('/', TokenKind::Join, TokenKind::Invalid); break;
     case '!':
-      kind = two('=', TokenKind::BangEq, TokenKind::Invalid);
+      kind = two('=', TokenKind::BangEq, TokenKind::Bang);
       break;
     default:
       advance();

@@ -1,0 +1,9 @@
+package feachbad
+
+pub fn bad(p: Path(i32, 0, 1)): i32
+    var n: i32 = 0
+    foreach i in I do
+        n = p @ i
+    end
+    ret n
+end

@@ -1,0 +1,5 @@
+package cofnbad
+
+pub cofn bad(xs: Vector(i32)): i32
+    ret 0
+end

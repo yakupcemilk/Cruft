@@ -11,32 +11,32 @@ extern fn cruft_stdin(): ptr
 extern fn cruft_io_write(data: ptr, len: i64, stream: ptr)
 extern fn cruft_read_line(buf: ptr, cap: i64): i64
 
-pub fn stdout(): ptr
+pub fn stdout(): ptr ! {io}
     ret cruft_stdout()
 end
 
-pub fn stderr(): ptr
+pub fn stderr(): ptr ! {io}
     ret cruft_stderr()
 end
 
-pub fn stdin(): ptr
+pub fn stdin(): ptr ! {io}
     ret cruft_stdin()
 end
 
-pub fn print(msg: str)
+pub fn print(msg: str) ! {io}
     cruft_io_write(msg.data(), msg.byte_len(), stdout())
 end
 
-pub fn println(msg: str)
+pub fn println(msg: str) ! {io}
     print(msg)
     cruft_io_write("\n".data(), 1, stdout())
 end
 
-pub fn eprint(msg: str)
+pub fn eprint(msg: str) ! {io}
     cruft_io_write(msg.data(), msg.byte_len(), stderr())
 end
 
-pub fn read_line(): String
+pub fn read_line(): String ! {io, alloc}
     var buf: String = alloc_string(4096)
     var n: i64 = cruft_read_line(buf.data(), 4097)
     if n < 0 then

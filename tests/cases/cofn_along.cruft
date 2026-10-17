@@ -1,0 +1,13 @@
+package alongok
+
+pub cofn step(n: i32): i32
+    if true then
+        ret n
+    end
+    step(n) along refl(n)
+end
+
+pub fn main(): i32
+    print(step(2))
+    ret 0
+end

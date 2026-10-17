@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,48 @@ inline const char *visibilityName(Visibility v) {
   return v == Visibility::Public ? "pub" : "pri";
 }
 
+/// How many times a binding may be used. `Many` is the default for copyable
+/// data. Storage types default to `Affine` unless the binding says `lin`.
+enum class Usage : std::uint8_t { Many, Affine, Linear };
+
+/// Information-flow label. Flow may stay put or rise; a fall needs a `Leak` path.
+enum class Secrecy : std::uint8_t { Public, Private, Secret };
+
+inline const char *secrecyName(Secrecy s) {
+  switch (s) {
+  case Secrecy::Public: return "Public";
+  case Secrecy::Private: return "Private";
+  case Secrecy::Secret: return "Secret";
+  }
+  return "?";
+}
+
+inline int secrecyRank(Secrecy s) { return static_cast<int>(s); }
+
+/// Effect row bits. A missing row on a function is open (not a promise of purity).
+enum class Effect : std::uint8_t { None = 0, Io = 1, Alloc = 2, Net = 4 };
+using EffectSet = std::uint8_t;
+
+inline constexpr EffectSet effectIo = static_cast<EffectSet>(Effect::Io);
+inline constexpr EffectSet effectAlloc = static_cast<EffectSet>(Effect::Alloc);
+inline constexpr EffectSet effectNet = static_cast<EffectSet>(Effect::Net);
+
+inline bool namedEffect(std::string_view name, EffectSet &bit) {
+  if (name == "io") {
+    bit = effectIo;
+    return true;
+  }
+  if (name == "alloc") {
+    bit = effectAlloc;
+    return true;
+  }
+  if (name == "net") {
+    bit = effectNet;
+    return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Syntactic types
 // ---------------------------------------------------------------------------
@@ -39,10 +82,11 @@ struct TypeExpr;
 using TypeExprPtr = std::unique_ptr<TypeExpr>;
 
 enum class TypeExprKind {
-  Named, ///< i32, bool, I, Type, or a (possibly package-qualified) user type
-  Path,  ///< Path(T, a, b)
-  Equiv, ///< Equiv(A, B)
-  Fn     ///< fn(A, B): R
+  Named,    ///< i32, bool, I, Type, or a (possibly package-qualified) user type
+  Path,     ///< Path(T, a, b)
+  Equiv,    ///< Equiv(A, B)
+  Fn,       ///< fn(A, B): R
+  Quotient  ///< Quotient(T, rel, canon)
 };
 
 struct TypeExpr {
@@ -60,6 +104,11 @@ struct TypeExpr {
   // Equiv / Fn
   std::vector<TypeExprPtr> params; ///< Equiv: {A, B}; Fn: parameter types
   TypeExprPtr ret;                 ///< Fn only; null => void
+
+  /// Fn effect row. `effectsDeclared` is false when the source omits `!`.
+  EffectSet effects = 0;
+  std::string effectVar;
+  bool effectsDeclared = false;
 
   explicit TypeExpr(TypeExprKind k, SourceLocation l) : kind(k), loc(std::move(l)) {}
   [[nodiscard]] TypeExprPtr clone() const;
@@ -113,7 +162,10 @@ enum class Builtin {
   Iso,       ///< iso(f, g, sec, retr) : Equiv(A, B)
   RawSlice,    ///< raw_slice(addr, len) : Slice(T)  (T taken from the expected type)
   NullPtr,     ///< null() : ptr
-  AllocString  ///< alloc_string(nbytes) : String  (heap, NUL-terminated)
+  AllocString, ///< alloc_string(nbytes) : String  (heap, NUL-terminated)
+  Seal,        ///< seal(x) : Secret(T)
+  Reveal,      ///< reveal(s, p) : T   where p : Leak(label(s), Public)
+  Quot         ///< quot(x, p) : Quotient(T, rel, canon)
 };
 
 /// How a `transport` call computes once its type path has been normalised.
@@ -123,6 +175,8 @@ struct Expr {
   ExprKind kind;
   SourceLocation loc;
   TypeRef type; ///< filled in by the TypeChecker
+  /// Set when this value is an affine or linear resource. Copyable data stays `Many`.
+  Usage flow = Usage::Many;
 
   Expr(ExprKind k, SourceLocation l) : kind(k), loc(std::move(l)) {}
   virtual ~Expr() = default;
@@ -181,6 +235,11 @@ struct CallExpr final : Expr {
   const sema::Symbol *fn = nullptr;          ///< direct callee (function / ctor)
   TransportDir transportDir = TransportDir::Identity;
   const sema::Symbol *transportFn = nullptr; ///< fn implementing the transport
+  const sema::Symbol *quotCanon = nullptr;   ///< canon function of a `quot` introduction
+  ExprPtr along;                             ///< erased path justifying a cofn step
+  bool tailSelf = false;                     ///< cofn tail call, lowered to a back-edge
+  bool hasEffectInst = false;                ///< `f[{io}](...)`
+  EffectSet effectInst = 0;
 
   CallExpr(SourceLocation l, ExprPtr c, std::vector<ExprPtr> a)
       : Expr(ExprKind::Call, std::move(l)), callee(std::move(c)), args(std::move(a)) {}
@@ -289,7 +348,7 @@ struct MatchExpr final : Expr {
 // Statements
 // ---------------------------------------------------------------------------
 
-enum class StmtKind { VarDecl, Assign, Return, If, While, Expr, ScopeArena, Error };
+enum class StmtKind { VarDecl, Assign, Return, If, While, Foreach, Expr, ScopeArena, Error };
 
 struct Stmt {
   StmtKind kind;
@@ -303,6 +362,7 @@ using Block = std::vector<StmtPtr>;
 struct VarDeclStmt final : Stmt {
   bool isConst;
   bool shared = false; ///< `shared var` — reference counted; otherwise owned (affine)
+  Usage usage = Usage::Many; ///< `lin` / `aff`; `Many` means infer from the type
   std::string name;
   TypeExprPtr type; ///< null when the type is inferred from the initializer
   ExprPtr init;
@@ -338,6 +398,16 @@ struct WhileStmt final : Stmt {
   Block body;
   WhileStmt(SourceLocation l, ExprPtr c, Block b)
       : Stmt(StmtKind::While, std::move(l)), cond(std::move(c)), body(std::move(b)) {}
+};
+
+/// `foreach i in I do ... end`. Checked at the faces `i = 0` and `i = 1`, then
+/// erased to one `i0` residue. The interval is not a runtime loop.
+struct ForeachStmt final : Stmt {
+  std::string var;
+  Block body;
+  const sema::Symbol *binder = nullptr;
+  ForeachStmt(SourceLocation l, std::string v, Block b)
+      : Stmt(StmtKind::Foreach, std::move(l)), var(std::move(v)), body(std::move(b)) {}
 };
 
 struct ExprStmt final : Stmt {
@@ -378,11 +448,13 @@ struct ErrorStmt final : Stmt {
 struct Param {
   std::string name;
   TypeExprPtr type; ///< null when a lambda parameter's type is inferred
+  Usage usage = Usage::Many;
   SourceLocation loc;
 
   [[nodiscard]] Param clone() const {
     Param p;
     p.name = name;
+    p.usage = usage;
     p.loc = loc;
     if (type)
       p.type = type->clone();
@@ -402,10 +474,23 @@ struct LambdaExpr final : Expr {
 struct FnDecl {
   Visibility visibility = Visibility::Private;
   bool isExtern = false;
+  bool isCofn = false; ///< tail-recursive loop; state must be fixed-size
   std::string name;
+  std::string effectVar; ///< binder from `fn name[e]`
+  EffectSet effects = 0;
+  bool effectsDeclared = false;
   std::vector<Param> params;
   TypeExprPtr ret; ///< null => void
   Block body;      ///< empty for extern declarations
+  SourceLocation loc;
+  sema::Symbol *symbol = nullptr;
+};
+
+/// `axiom name : Leak(Secret, Public)`. Erased. The only way to inhabit `Leak`.
+struct AxiomDecl {
+  Visibility visibility = Visibility::Private;
+  std::string name;
+  TypeExprPtr type;
   SourceLocation loc;
   sema::Symbol *symbol = nullptr;
 };
@@ -473,6 +558,7 @@ struct File {
   std::vector<ExportDecl> exports;
   std::vector<std::unique_ptr<TypeDecl>> types;
   std::vector<std::unique_ptr<GlobalDecl>> globals;
+  std::vector<std::unique_ptr<AxiomDecl>> axioms;
   std::vector<std::unique_ptr<FnDecl>> functions;
 };
 

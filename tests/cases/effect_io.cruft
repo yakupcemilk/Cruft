@@ -1,0 +1,6 @@
+package eio
+
+pub fn main(): i32 ! {io}
+    print(7)
+    ret 0
+end

@@ -204,6 +204,9 @@ void visitStmt(Stmt &stmt, Summary &summary, bool inArena) {
     visitBlock(w.body, summary, inArena);
     break;
   }
+  case StmtKind::Foreach:
+    visitBlock(static_cast<ForeachStmt &>(stmt).body, summary, inArena);
+    break;
   case StmtKind::Expr:
     if (static_cast<ExprStmt &>(stmt).expr)
       visitExpr(*static_cast<ExprStmt &>(stmt).expr, summary);

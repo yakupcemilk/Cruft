@@ -1,0 +1,5 @@
+package lindrop
+
+pub fn bad(lin x: i32): i32
+    ret 0
+end
