@@ -1,0 +1,6 @@
+package enumbad
+
+enum Bad
+    A
+    loop : Path(Bad, A, A)
+end

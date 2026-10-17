@@ -28,6 +28,7 @@ const std::map<std::string, Builtin> &builtinTable() {
       {"seal", Builtin::Seal},
       {"reveal", Builtin::Reveal},
       {"quot", Builtin::Quot},
+      {"text", Builtin::Text},
   };
   return table;
 }
@@ -289,6 +290,15 @@ void TypeChecker::collectFile(File &file) {
     }
   }
 
+  for (auto &sd : file.structs) {
+    Symbol ss;
+    ss.kind = SymbolKind::Type;
+    ss.name = sd->name;
+    ss.visibility = sd->visibility;
+    ss.loc = sd->loc;
+    sd->symbol = declare(std::move(ss));
+  }
+
   for (auto &g : file.globals) {
     Symbol gs;
     gs.kind = SymbolKind::Global;
@@ -376,6 +386,11 @@ void TypeChecker::ensureNotLeakingPrivate(const Type &t, const SourceLocation &l
         walk(*p);
       walk(*ty.ret);
       break;
+    case TypeKind::Struct:
+      for (const auto &p : ty.params)
+        if (p)
+          walk(*p);
+      break;
     case TypeKind::Vector:
     case TypeKind::Slice:
     case TypeKind::Labeled:
@@ -436,6 +451,9 @@ void TypeChecker::resolveFileSignatures(File &file) {
         }
         TypePtr result;
         if (ctor.pathType) {
+          if (td->isEnum)
+            diags_.error(ctor.loc, "enum '" + td->name +
+                                       "' cannot have a path constructor; use 'type' for a higher inductive");
           result = resolveType(*ctor.pathType);
           if (result->kind != TypeKind::Path || result->elem->kind != TypeKind::Inductive ||
               result->elem->inductive != td->symbol) {
@@ -453,6 +471,32 @@ void TypeChecker::resolveFileSignatures(File &file) {
             params.empty() ? result : Type::fn(std::move(params), std::move(paramSyms), result);
       }
     }
+  }
+
+  // --- structs (dependent fields see the symbols of earlier fields)
+  for (auto &sd : file.structs) {
+    if (!sd->symbol)
+      continue;
+    pushScope();
+    std::vector<TypePtr> fields;
+    std::vector<const Symbol *> fieldSyms;
+    for (auto &field : sd->fields) {
+      TypePtr ft = resolveType(*field.type);
+      if (ft->kind == TypeKind::Struct && ft->inductive == sd->symbol)
+        diags_.error(field.loc, "struct '" + sd->name + "' cannot contain itself by value");
+      Symbol fs;
+      fs.kind = SymbolKind::Param;
+      fs.name = field.name;
+      fs.type = ft;
+      fs.loc = field.loc;
+      Symbol *s = declareLocal(std::move(fs));
+      fields.push_back(ft);
+      fieldSyms.push_back(s);
+    }
+    popScope();
+    sd->symbol->type = Type::structOf(sd->symbol, std::move(fields), std::move(fieldSyms));
+    if (sd->visibility == Visibility::Public)
+      ensureNotLeakingPrivate(*sd->symbol->type, sd->loc, "public struct '" + sd->name + "'");
   }
 
   // --- globals
@@ -474,6 +518,27 @@ void TypeChecker::resolveFileSignatures(File &file) {
     if (!fn->symbol)
       continue;
     pushScope();
+    const Symbol *typeParam = nullptr;
+    int typeParamLevel = -1;
+    if (!fn->typeParam.empty()) {
+      if (!fn->typeParamBound)
+        diags_.error(fn->loc, "type binder '" + fn->typeParam + "' needs a universe, as in [T: Type(0)]");
+      else {
+        TypePtr bound = resolveType(*fn->typeParamBound);
+        if (bound->kind != TypeKind::Universe)
+          diags_.error(fn->typeParamBound->loc, "type binder '" + fn->typeParam +
+                                                    "' must be bounded by a universe, found '" +
+                                                    bound->str() + "'");
+        else
+          typeParamLevel = bound->level;
+      }
+      Symbol ts;
+      ts.kind = SymbolKind::TypeParam;
+      ts.name = fn->typeParam;
+      ts.type = Type::universe(typeParamLevel < 0 ? 0 : typeParamLevel);
+      ts.loc = fn->loc;
+      typeParam = declareLocal(std::move(ts));
+    }
     std::vector<TypePtr> params;
     std::vector<const Symbol *> paramSyms;
     std::vector<Usage> paramUses;
@@ -499,8 +564,11 @@ void TypeChecker::resolveFileSignatures(File &file) {
 
     std::string rowVar = fn->effectsDeclared && fn->effects == 0 ? fn->effectVar : std::string{};
     TypePtr fnType = Type::fn(params, paramSyms, ret, paramUses, fn->effects, rowVar,
-                              fn->effectsDeclared);
+                              fn->effectsDeclared, typeParam, typeParamLevel);
     fn->symbol->type = fnType;
+
+    if (fn->isExtern && typeParam)
+      diags_.error(fn->loc, "extern function '" + fn->name + "' cannot have a type binder");
 
     if (fn->isExtern) {
       // FFI: everything crossing the boundary must have a C layout.
@@ -540,7 +608,30 @@ TypePtr TypeChecker::resolveType(const TypeExpr &t) {
       if (t.name == "f64") return Type::f64();
       if (t.name == "bool") return Type::boolean();
       if (t.name == "I") return Type::interval();
-      if (t.name == "Type") return Type::universe();
+      if (t.name == "Type") {
+        if (!t.params.empty())
+          return fail(t.loc, "'Type' takes a level in parentheses, as in Type(1)");
+        return Type::universe(t.level);
+      }
+      if (t.name == "Text") {
+        if (!t.params.empty())
+          return fail(t.loc, "'Text' takes no type arguments");
+        return Type::text();
+      }
+      if (t.name == "Vec") {
+        if (t.params.size() != 1 || !t.lhs)
+          return fail(t.loc, "'Vec' expects an element type and a length, as in Vec(i32, 2)");
+        TypePtr elem = resolveType(*t.params[0]);
+        if (elem->isError())
+          return elem;
+        ExprPtr len = t.lhs->clone();
+        TypePtr lt = checkExpr(len, Type::i32().get());
+        if (lt->isError())
+          return lt;
+        if (lt->kind != TypeKind::I32)
+          return fail(t.lhs->loc, "Vec length must be 'i32', found '" + lt->str() + "'");
+        return Type::vector(std::move(elem), currentRegion_, std::move(len));
+      }
       if (t.name == "String" || t.name == "str") {
         if (!t.params.empty())
           return fail(t.loc, "'String' takes no type arguments");
@@ -613,6 +704,8 @@ TypePtr TypeChecker::resolveType(const TypeExpr &t) {
     Symbol *sym = resolveName(t.package, t.name, t.loc);
     if (!sym)
       return Type::error();
+    if (sym->kind == SymbolKind::TypeParam)
+      return Type::typeVariable(sym);
     if (sym->kind != SymbolKind::Type)
       return fail(t.loc, "'" + sym->qualifiedName() + "' is not a type");
     return sym->type;
@@ -846,6 +939,8 @@ void TypeChecker::checkFunction(FnDecl &fn) {
   effectStack_.push_back(row);
 
   pushScope();
+  if (fnType.typeParam)
+    scopes_.back().names[fnType.typeParam->name] = const_cast<Symbol *>(fnType.typeParam);
   for (size_t i = 0; i < fn.params.size(); ++i)
     if (i < fnType.paramSymbols.size() && fnType.paramSymbols[i])
       scopes_.back().names[fn.params[i].name] = const_cast<Symbol *>(fnType.paramSymbols[i]);
@@ -1081,6 +1176,10 @@ bool TypeChecker::unify(const Type &actual, const Type &expected, const SourceLo
                         const std::string &context) {
   if (actual.isError() || expected.isError())
     return false;
+  if (actual.kind == TypeKind::Universe && expected.kind == TypeKind::Universe &&
+      actual.level <= expected.level) {
+    return true;
+  }
   if (normalizer_.typeEqual(actual, expected)) {
     if (actual.kind == TypeKind::Fn && expected.kind == TypeKind::Fn &&
         !effectsCompatible(actual, expected)) {
@@ -1132,7 +1231,7 @@ ExprPtr TypeChecker::makeTypeLit(const TypePtr &t, const SourceLocation &loc) co
   te->name = t->str();
   auto lit = std::make_unique<TypeLitExpr>(loc, std::move(te));
   lit->denoted = t;
-  lit->type = Type::universe();
+  lit->type = typeOfDenoted(*t);
   return lit;
 }
 
@@ -1194,7 +1293,7 @@ TypePtr TypeChecker::checkExpr(ExprPtr &e, const Type *expected) {
   case ExprKind::TypeLit: {
     auto &lit = as<TypeLitExpr>(*e);
     lit.denoted = resolveType(*lit.typeExpr);
-    t = lit.denoted->isError() ? Type::error() : Type::universe();
+    t = lit.denoted->isError() ? Type::error() : typeOfDenoted(*lit.denoted);
     break;
   }
   case ExprKind::PathAbs:
@@ -1249,13 +1348,18 @@ TypePtr TypeChecker::checkIdent(ExprPtr &e, const Type *expected) {
     return sym->type ? sym->type : Type::error();
   case SymbolKind::Axiom:
     return sym->type ? sym->type : Type::error();
+  case SymbolKind::TypeParam: {
+    ExprPtr lit = makeTypeLit(Type::typeVariable(sym), id.loc);
+    e = std::move(lit);
+    return typeOfDenoted(*Type::typeVariable(sym));
+  }
   case SymbolKind::Function:
     return sym->type; // first-class reference => C function pointer
   case SymbolKind::Type: {
     // A type used as a term: rewrite to a type literal.
     ExprPtr lit = makeTypeLit(sym->type, id.loc);
     e = std::move(lit);
-    return Type::universe();
+    return typeOfDenoted(*sym->type);
   }
   case SymbolKind::Ctor: {
     if (!sym->type || sym->type->isError())
@@ -1393,6 +1497,11 @@ TypePtr TypeChecker::checkCall(ExprPtr &e, const Type *expected) {
     if (!sym)
       return Type::error();
     callee.symbol = sym;
+    if (sym->kind == SymbolKind::Type && sym->type && sym->type->kind == TypeKind::Struct) {
+      call.fn = sym;
+      callee.type = sym->type;
+      return checkStructCall(call, *sym->type);
+    }
     if (sym->kind == SymbolKind::Function || sym->kind == SymbolKind::Ctor) {
       if (!sym->type || sym->type->isError())
         return Type::error();
@@ -1419,6 +1528,28 @@ TypePtr TypeChecker::checkFnCall(CallExpr &call, const Type &fnType, const Type 
   (void)expected;
   TypePtr instantiated;
   const Type *use = &fnType;
+  if (fnType.typeParam) {
+    if (!call.hasTypeArg || !call.typeArg)
+      return fail(call.loc, "function '" + fnType.typeParam->name +
+                                "' must be instantiated, as in name[i32](...)");
+    TypePtr argTy = resolveType(*call.typeArg);
+    if (argTy->isError())
+      return argTy;
+    int level = universeOf(*argTy);
+    if (level > fnType.typeParamLevel) {
+      diags_.error(call.typeArg->loc, "type '" + argTy->str() + "' lives in Type(" +
+                                           std::to_string(level) + "), above the binder Type(" +
+                                           std::to_string(fnType.typeParamLevel) + ")");
+      return Type::error();
+    }
+    call.typeArgument = argTy;
+    instantiated = substTypeVar(Type::fn(fnType.params, fnType.paramSymbols, fnType.ret, fnType.paramUse,
+                                         fnType.effects, fnType.effectVar, fnType.effectsDeclared),
+                                fnType.typeParam, argTy);
+    use = instantiated.get();
+  } else if (call.hasTypeArg) {
+    return fail(call.loc, "type instantiation requires a binder, as in 'fn id[T: Type(0)](...)'");
+  }
   if (call.hasEffectInst) {
     if (fnType.effectVar.empty())
       return fail(call.loc, "effect instantiation requires an effect variable, as in 'fn f[e](...) ! e'");
@@ -1666,6 +1797,16 @@ TypePtr TypeChecker::checkBuiltinCall(CallExpr &call, Builtin builtin, const Typ
     call.quotCanon = expected->canonFn;
     return Type::quotient(expected->elem, expected->lhs ? expected->lhs->clone() : nullptr,
                           expected->rhs ? expected->rhs->clone() : nullptr, expected->canonFn);
+  }
+  case Builtin::Text: {
+    if (!arity(1, "text"))
+      return Type::error();
+    TypePtr t = checkExpr(call.args[0]);
+    if (t->isError())
+      return t;
+    if (call.args[0]->kind != ExprKind::StringLit)
+      return fail(call.args[0]->loc, "'text' expects a string literal");
+    return Type::text();
   }
   case Builtin::RawSlice: {
     if (!arity(2, "raw_slice"))
@@ -2216,10 +2357,22 @@ TypePtr TypeChecker::checkArray(ArrayLitExpr &a, const Type *expected) {
     return Type::map(expected->a, expected->b, currentRegion_);
   }
   TypePtr elem = expected && expected->kind == TypeKind::Vector ? expected->elem : nullptr;
+  ast::ExprPtr vecLen = expected && expected->kind == TypeKind::Vector && expected->vecLen
+                            ? expected->vecLen->clone()
+                            : nullptr;
+  if (vecLen) {
+    ExprPtr nf = normalizer_.normalize(*vecLen);
+    if (nf->kind != ExprKind::IntLit)
+      return fail(a.loc, "Vec length must be a constant at this construction site, found '" +
+                             toString(*nf) + "'");
+    if (as<IntLitExpr>(*nf).value != static_cast<std::int64_t>(a.elems.size()))
+      return fail(a.loc, "Vec length is " + std::to_string(as<IntLitExpr>(*nf).value) +
+                             " but the array has " + std::to_string(a.elems.size()) + " element(s)");
+  }
   if (a.elems.empty()) {
     if (!elem)
       return fail(a.loc, "cannot infer the element type of '[]'; write 'var xs: Vector(i32) = []'");
-    return Type::vector(elem, currentRegion_);
+    return Type::vector(elem, currentRegion_, std::move(vecLen));
   }
   for (auto &el : a.elems) {
     TypePtr et = checkExpr(el, elem.get());
@@ -2232,7 +2385,7 @@ TypePtr TypeChecker::checkArray(ArrayLitExpr &a, const Type *expected) {
   }
   if (elem->isErased() || elem->kind == TypeKind::Void)
     return fail(a.loc, "array elements must be runtime data");
-  return Type::vector(std::move(elem), currentRegion_);
+  return Type::vector(std::move(elem), currentRegion_, std::move(vecLen));
 }
 
 TypePtr TypeChecker::checkLambda(LambdaExpr &l, const Type *expected) {
@@ -2311,6 +2464,17 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
   consume_ = savedConsume;
   if (recv->isError())
     return recv;
+  if (recv->kind == TypeKind::Struct && !m.invoked) {
+    for (size_t i = 0; i < recv->params.size(); ++i) {
+      const Symbol *field = i < recv->paramSymbols.size() ? recv->paramSymbols[i] : nullptr;
+      if (!field || field->name != m.method)
+        continue;
+      if (recv->params[i] && recv->params[i]->isStorage() && m.receiver->kind == ExprKind::Ident)
+        noteUse(as<IdentExpr>(*m.receiver).symbol, m.loc);
+      return recv->params[i] ? recv->params[i] : Type::error();
+    }
+    return fail(m.loc, "struct has no field '" + m.method + "'");
+  }
   if (!m.invoked)
     return fail(m.loc, "use '.' for a call, as in value." + m.method + "(...)");
 
@@ -2321,6 +2485,14 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
                     std::to_string(m.args.size()));
     return false;
   };
+
+  if (recv->kind == TypeKind::Text) {
+    if (m.method == "length")
+      return arity(0) ? Type::i64() : Type::error();
+    if (m.method == "data")
+      return arity(0) ? Type::ptr() : Type::error();
+    return fail(m.loc, "Text has no method '" + m.method + "' (expected length or data)");
+  }
 
   if (recv->kind == TypeKind::Ptr) {
     if (m.method == "addr")
@@ -2667,7 +2839,7 @@ TypePtr TypeChecker::instantiateEffects(const TypePtr &type, const std::string &
   if (!changed)
     return type;
   return Type::fn(std::move(params), type->paramSymbols, std::move(ret), type->paramUse, effects,
-                  std::move(effectVar), declared);
+                  std::move(effectVar), declared, type->typeParam, type->typeParamLevel);
 }
 
 void TypeChecker::joinUses(const std::set<const Symbol *> &saved, const std::set<const Symbol *> &thenSet,
@@ -2947,6 +3119,101 @@ bool TypeChecker::isFixedSize(const Type &type, std::set<const Symbol *> &seen) 
   default:
     return true;
   }
+}
+
+TypePtr TypeChecker::substTypeVar(const TypePtr &type, const Symbol *var,
+                                  const TypePtr &replacement) const {
+  if (!type || !var)
+    return type;
+  if (type->kind == TypeKind::TyVar && type->tyVar == var)
+    return replacement;
+  if (type->kind == TypeKind::Labeled && type->elem)
+    return Type::labeled(substTypeVar(type->elem, var, replacement), type->secrecy);
+  if (type->kind == TypeKind::Vector && type->elem) {
+    TypePtr elem = substTypeVar(type->elem, var, replacement);
+    if (elem == type->elem)
+      return type;
+    return Type::vector(std::move(elem), type->region, type->vecLen ? type->vecLen->clone() : nullptr);
+  }
+  if (type->kind == TypeKind::Slice && type->elem) {
+    TypePtr elem = substTypeVar(type->elem, var, replacement);
+    if (elem == type->elem)
+      return type;
+    return Type::slice(std::move(elem), type->region);
+  }
+  if (type->kind == TypeKind::Path && type->elem) {
+    TypePtr elem = substTypeVar(type->elem, var, replacement);
+    if (elem == type->elem)
+      return type;
+    return Type::path(std::move(elem), type->lhs ? type->lhs->clone() : nullptr,
+                      type->rhs ? type->rhs->clone() : nullptr);
+  }
+  if (type->kind == TypeKind::Struct) {
+    bool changed = false;
+    std::vector<TypePtr> fields;
+    for (const auto &field : type->params) {
+      fields.push_back(substTypeVar(field, var, replacement));
+      changed = changed || fields.back() != field;
+    }
+    if (!changed)
+      return type;
+    return Type::structOf(type->inductive, std::move(fields), type->paramSymbols);
+  }
+  if (type->kind != TypeKind::Fn)
+    return type;
+  bool changed = false;
+  std::vector<TypePtr> params;
+  for (const auto &p : type->params) {
+    params.push_back(substTypeVar(p, var, replacement));
+    changed = changed || params.back() != p;
+  }
+  TypePtr ret = substTypeVar(type->ret, var, replacement);
+  changed = changed || ret != type->ret;
+  if (!changed)
+    return type;
+  return Type::fn(std::move(params), type->paramSymbols, std::move(ret), type->paramUse, type->effects,
+                  type->effectVar, type->effectsDeclared);
+}
+
+int TypeChecker::universeOf(const Type &type) const {
+  if (type.kind == TypeKind::Universe)
+    return type.level + 1;
+  if (type.kind == TypeKind::TyVar && type.tyVar && type.tyVar->type &&
+      type.tyVar->type->kind == TypeKind::Universe)
+    return type.tyVar->type->level;
+  return 0;
+}
+
+TypePtr TypeChecker::typeOfDenoted(const Type &denoted) const {
+  if (denoted.kind == TypeKind::Universe)
+    return Type::universe(denoted.level + 1);
+  if (denoted.kind == TypeKind::TyVar && denoted.tyVar && denoted.tyVar->type)
+    return denoted.tyVar->type;
+  return Type::universe(0);
+}
+
+TypePtr TypeChecker::checkStructCall(CallExpr &call, const Type &structType) {
+  if (call.args.size() != structType.params.size())
+    return fail(call.loc, "struct '" + structType.str() + "' expects " +
+                              std::to_string(structType.params.size()) + " field(s), found " +
+                              std::to_string(call.args.size()));
+  std::vector<TypePtr> fieldTypes = structType.params;
+  bool ok = true;
+  for (size_t i = 0; i < call.args.size(); ++i) {
+    TypePtr at = checkExpr(call.args[i], fieldTypes[i].get());
+    if (at->isError() || !unify(*at, *fieldTypes[i], call.args[i]->loc,
+                                "field " + std::to_string(i + 1) + " of '" + structType.str() + "'")) {
+      ok = false;
+      continue;
+    }
+    if (i < structType.paramSymbols.size() && structType.paramSymbols[i]) {
+      for (size_t j = i + 1; j < fieldTypes.size(); ++j)
+        fieldTypes[j] = normalizer_.substituteType(fieldTypes[j], structType.paramSymbols[i],
+                                                    *call.args[i]);
+    }
+  }
+  return ok ? Type::structOf(structType.inductive, structType.params, structType.paramSymbols)
+            : Type::error();
 }
 
 void TypeChecker::checkAlong(CallExpr &call, const Type &fnType) {

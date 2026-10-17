@@ -28,7 +28,8 @@ const std::unordered_map<std::string_view, TokenKind> &keywordTable() {
       {"shared", TokenKind::KwShared},   {"lin", TokenKind::KwLin},
       {"aff", TokenKind::KwAff},         {"foreach", TokenKind::KwForeach},
       {"cofn", TokenKind::KwCofn},       {"along", TokenKind::KwAlong},
-      {"axiom", TokenKind::KwAxiom},     {"i32", TokenKind::KwI32},
+      {"axiom", TokenKind::KwAxiom},     {"struct", TokenKind::KwStruct},
+      {"enum", TokenKind::KwEnum},       {"i32", TokenKind::KwI32},
       {"i64", TokenKind::KwI64},         {"f32", TokenKind::KwF32},
       {"f64", TokenKind::KwF64},         {"bool", TokenKind::KwBool},
       {"ptr", TokenKind::KwPtr},
@@ -79,6 +80,8 @@ std::string_view tokenKindName(TokenKind k) {
   case TokenKind::KwCofn: return "'cofn'";
   case TokenKind::KwAlong: return "'along'";
   case TokenKind::KwAxiom: return "'axiom'";
+  case TokenKind::KwStruct: return "'struct'";
+  case TokenKind::KwEnum: return "'enum'";
   case TokenKind::KwI32: return "'i32'";
   case TokenKind::KwI64: return "'i64'";
   case TokenKind::KwF32: return "'f32'";

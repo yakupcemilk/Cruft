@@ -1,0 +1,10 @@
+package ident
+
+fn id[T: Type(0)](x: T): T
+    ret x
+end
+
+pub fn main(): i32
+    print(id[i32](4))
+    ret 0
+end

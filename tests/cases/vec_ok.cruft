@@ -1,0 +1,7 @@
+package veclen
+
+pub fn main(): i32
+    var v: Vec(i32, 2) = [4, 5]
+    print(v.at(1))
+    ret 0
+end

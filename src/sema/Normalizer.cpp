@@ -390,6 +390,10 @@ ExprPtr Normalizer::substitute(const Expr &e, const Symbol *var, const Expr &wit
     n->tailSelf = c.tailSelf;
     n->hasEffectInst = c.hasEffectInst;
     n->effectInst = c.effectInst;
+    n->hasTypeArg = c.hasTypeArg;
+    n->typeArgument = c.typeArgument;
+    if (c.typeArg)
+      n->typeArg = c.typeArg->clone();
     if (c.along)
       n->along = substitute(*c.along, var, with);
     n->type = substituteType(e.type, var, with);
@@ -518,7 +522,26 @@ TypePtr Normalizer::substituteType(const TypePtr &t, const Symbol *var, const Ex
     if (!changed)
       return t;
     return Type::fn(std::move(params), t->paramSymbols, std::move(ret), t->paramUse, t->effects,
-                    t->effectVar, t->effectsDeclared);
+                    t->effectVar, t->effectsDeclared, t->typeParam, t->typeParamLevel);
+  }
+  case TypeKind::Vector: {
+    TypePtr elem = substituteType(t->elem, var, with);
+    bool lenMentions = t->vecLen && mentions(*t->vecLen, var);
+    if (elem == t->elem && !lenMentions)
+      return t;
+    return Type::vector(std::move(elem), t->region,
+                        t->vecLen ? substitute(*t->vecLen, var, with) : nullptr);
+  }
+  case TypeKind::Struct: {
+    bool changed = false;
+    std::vector<TypePtr> fields;
+    for (const auto &p : t->params) {
+      fields.push_back(substituteType(p, var, with));
+      changed = changed || fields.back() != p;
+    }
+    if (!changed)
+      return t;
+    return Type::structOf(t->inductive, std::move(fields), t->paramSymbols);
   }
   case TypeKind::Labeled: {
     TypePtr elem = substituteType(t->elem, var, with);
@@ -710,8 +733,33 @@ bool Normalizer::typeEqualImpl(const Type &a, const Type &b, BinderMap &binders)
   }
   case TypeKind::Inductive:
     return a.inductive == b.inductive;
-  case TypeKind::Vector:
-    return a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
+  case TypeKind::Vector: {
+    if (!a.elem || !b.elem || !typeEqualImpl(*a.elem, *b.elem, binders))
+      return false;
+    if (!a.vecLen && !b.vecLen)
+      return true;
+    if (!a.vecLen || !b.vecLen)
+      return false;
+    int savedFuel = fuel_;
+    ExprPtr al = normalize(*a.vecLen);
+    ExprPtr bl = normalize(*b.vecLen);
+    fuel_ = savedFuel;
+    return alphaEq(*al, *bl, binders);
+  }
+  case TypeKind::Universe:
+    return a.level == b.level;
+  case TypeKind::Text:
+    return true;
+  case TypeKind::TyVar:
+    return a.tyVar == b.tyVar;
+  case TypeKind::Struct: {
+    if (a.inductive != b.inductive || a.params.size() != b.params.size())
+      return false;
+    for (size_t i = 0; i < a.params.size(); ++i)
+      if (!a.params[i] || !b.params[i] || !typeEqualImpl(*a.params[i], *b.params[i], binders))
+        return false;
+    return true;
+  }
   case TypeKind::Map:
     return a.a && b.a && a.b && b.b && typeEqualImpl(*a.a, *b.a, binders) &&
            typeEqualImpl(*a.b, *b.b, binders);
@@ -1057,6 +1105,10 @@ ExprPtr Normalizer::normCall(const CallExpr &e) {
     n->tailSelf = e.tailSelf;
     n->hasEffectInst = e.hasEffectInst;
     n->effectInst = e.effectInst;
+    n->hasTypeArg = e.hasTypeArg;
+    n->typeArgument = e.typeArgument;
+    if (e.typeArg)
+      n->typeArg = e.typeArg->clone();
     if (e.along)
       n->along = e.along->clone();
     n->type = e.type;

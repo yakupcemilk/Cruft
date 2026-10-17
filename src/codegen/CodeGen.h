@@ -92,6 +92,9 @@ private:
   llvm::Value *genArray(const ast::ArrayLitExpr &e);
   llvm::Value *genString(const ast::StringLitExpr &e);
   llvm::Value *genMethod(const ast::MethodCallExpr &e);
+  llvm::Value *genStruct(const ast::CallExpr &e);
+  llvm::Function *specialize(const ast::FnDecl &fn, const sema::TypePtr &arg);
+  int runtimeField(const sema::Type &structType, size_t field);
   llvm::Function *lowerLambda(const ast::LambdaExpr &e);
 
   llvm::StructType *bufferType();
@@ -154,6 +157,8 @@ private:
   bool cofn_ = false;
   llvm::BasicBlock *cofnHeader_ = nullptr;
   std::vector<const sema::Symbol *> cofnParams_;
+  std::map<const sema::Symbol *, sema::TypePtr> tySubst_;
+  std::map<std::string, llvm::Function *> specs_;
   int lambdaSeq_ = 0;
 };
 

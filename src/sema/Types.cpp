@@ -48,6 +48,20 @@ TypePtr Type::universe() {
   static TypePtr t = primitive(TypeKind::Universe);
   return t;
 }
+
+TypePtr Type::universe(int level) {
+  if (level <= 0)
+    return universe();
+  static std::map<int, TypePtr> cache;
+  auto it = cache.find(level);
+  if (it != cache.end())
+    return it->second;
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::Universe;
+  t->level = level;
+  cache.emplace(level, t);
+  return t;
+}
 TypePtr Type::error() {
   static TypePtr t = primitive(TypeKind::Error);
   return t;
@@ -72,7 +86,8 @@ TypePtr Type::equiv(TypePtr a, TypePtr b) {
 
 TypePtr Type::fn(std::vector<TypePtr> params, std::vector<const Symbol *> paramSymbols,
                  TypePtr ret, std::vector<ast::Usage> paramUse, ast::EffectSet effects,
-                 std::string effectVar, bool effectsDeclared) {
+                 std::string effectVar, bool effectsDeclared, const Symbol *typeParam,
+                 int typeParamLevel) {
   auto t = std::make_shared<Type>();
   t->kind = TypeKind::Fn;
   t->params = std::move(params);
@@ -86,6 +101,8 @@ TypePtr Type::fn(std::vector<TypePtr> params, std::vector<const Symbol *> paramS
   t->effects = effects;
   t->effectVar = std::move(effectVar);
   t->effectsDeclared = effectsDeclared;
+  t->typeParam = typeParam;
+  t->typeParamLevel = typeParamLevel;
   return t;
 }
 
@@ -125,11 +142,36 @@ TypePtr Type::inductiveOf(const Symbol *sym) {
   return t;
 }
 
-TypePtr Type::vector(TypePtr elem, int region) {
+TypePtr Type::vector(TypePtr elem, int region, ast::ExprPtr len) {
   auto t = std::make_shared<Type>();
   t->kind = TypeKind::Vector;
   t->elem = std::move(elem);
   t->region = region;
+  t->vecLen = std::move(len);
+  return t;
+}
+
+TypePtr Type::text() {
+  static TypePtr t = primitive(TypeKind::Text);
+  return t;
+}
+
+TypePtr Type::structOf(const Symbol *sym, std::vector<TypePtr> fields,
+                       std::vector<const Symbol *> fieldSymbols) {
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::Struct;
+  t->inductive = sym;
+  t->params = std::move(fields);
+  t->paramSymbols = std::move(fieldSymbols);
+  if (t->paramSymbols.size() < t->params.size())
+    t->paramSymbols.resize(t->params.size(), nullptr);
+  return t;
+}
+
+TypePtr Type::typeVariable(const Symbol *sym) {
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::TyVar;
+  t->tyVar = sym;
   return t;
 }
 
@@ -197,7 +239,13 @@ std::string Type::str() const {
   case TypeKind::Ptr: return "ptr";
   case TypeKind::Void: return "void";
   case TypeKind::Interval: return "I";
-  case TypeKind::Universe: return "Type";
+  case TypeKind::Universe:
+    return level == 0 ? "Type" : "Type(" + std::to_string(level) + ")";
+  case TypeKind::Text: return "Text";
+  case TypeKind::TyVar:
+    return tyVar ? tyVar->name : "T";
+  case TypeKind::Struct:
+    return inductive ? inductive->qualifiedName() : "struct";
   case TypeKind::Error: return "<error>";
   case TypeKind::Path:
     return "Path(" + elem->str() + ", " + ast::toString(*lhs) + ", " + ast::toString(*rhs) + ")";
@@ -253,6 +301,8 @@ std::string Type::str() const {
   case TypeKind::Inductive:
     return inductive ? inductive->qualifiedName() : "<inductive>";
   case TypeKind::Vector:
+    if (vecLen)
+      return "Vec(" + (elem ? elem->str() : std::string("?")) + ", " + ast::toString(*vecLen) + ")";
     return "Vector(" + (elem ? elem->str() : std::string("?")) + ")";
   case TypeKind::Map:
     return "Map(" + (a ? a->str() : std::string("?")) + ", " + (b ? b->str() : std::string("?")) + ")";

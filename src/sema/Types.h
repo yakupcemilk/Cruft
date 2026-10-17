@@ -43,6 +43,9 @@ enum class TypeKind {
   Labeled,   ///< Secret(T) or Private(T); payload is `elem`, label is `secrecy`
   Leak,      ///< erased witness that a label may fall (no constructors)
   Quotient,  ///< Quotient(T, rel, canon); runtime representation is the carrier
+  Text,      ///< immutable {ptr, len}; copyable, no capacity
+  Struct,    ///< untagged product; later fields may mention earlier ones
+  TyVar,     ///< type binder T in fn id[T: Type(k)]
   Error      ///< poisoned type after a diagnostic
 };
 
@@ -73,7 +76,17 @@ struct Type {
   /// Named canon function of a quotient. The relation itself is erased.
   const Symbol *canonFn = nullptr;
 
-  // Inductive
+  /// Universe level. `Type` is level 0. A term `Type(i)` has type `Type(i+1)`.
+  int level = 0;
+  /// Length index of `Vec(T, n)`. Null for a dynamic `Vector(T)`. Erased in LLVM.
+  ast::ExprPtr vecLen;
+  /// Binder of a generic function. `-1` means the function is not generic.
+  const Symbol *typeParam = nullptr;
+  int typeParamLevel = -1;
+  /// TyVar: the binder this type stands for.
+  const Symbol *tyVar = nullptr;
+
+  // Inductive or struct
   const Symbol *inductive = nullptr;
 
   /// Allocation region. 0 is the heap / static region (a constant lifetime
@@ -91,19 +104,25 @@ struct Type {
   static TypePtr voidTy();
   static TypePtr interval();
   static TypePtr universe();
+  static TypePtr universe(int level);
   static TypePtr error();
   static TypePtr path(TypePtr elem, ast::ExprPtr lhs, ast::ExprPtr rhs);
   static TypePtr equiv(TypePtr a, TypePtr b);
   static TypePtr fn(std::vector<TypePtr> params, std::vector<const Symbol *> paramSymbols,
                     TypePtr ret, std::vector<ast::Usage> paramUse = {},
                     ast::EffectSet effects = 0, std::string effectVar = {},
-                    bool effectsDeclared = false);
+                    bool effectsDeclared = false, const Symbol *typeParam = nullptr,
+                    int typeParamLevel = -1);
   static TypePtr labeled(TypePtr elem, ast::Secrecy secrecy);
   static TypePtr leak(ast::Secrecy from, ast::Secrecy to);
   static TypePtr quotient(TypePtr carrier, ast::ExprPtr rel, ast::ExprPtr canon,
                           const Symbol *canonFn);
   static TypePtr inductiveOf(const Symbol *sym);
-  static TypePtr vector(TypePtr elem, int region);
+  static TypePtr vector(TypePtr elem, int region, ast::ExprPtr len = nullptr);
+  static TypePtr text();
+  static TypePtr structOf(const Symbol *sym, std::vector<TypePtr> fields,
+                          std::vector<const Symbol *> fieldSymbols);
+  static TypePtr typeVariable(const Symbol *sym);
   static TypePtr map(TypePtr key, TypePtr val, int region);
   static TypePtr stringTy(int region);
   static TypePtr slice(TypePtr elem, int region);
@@ -128,6 +147,12 @@ struct Type {
   [[nodiscard]] bool isStorage() const {
     if (kind == TypeKind::Labeled && elem)
       return elem->isStorage();
+    if (kind == TypeKind::Struct) {
+      for (const auto &field : params)
+        if (field && field->isStorage())
+          return true;
+      return false;
+    }
     return kind == TypeKind::Vector || kind == TypeKind::Map || kind == TypeKind::String;
   }
   /// Storage, plus non-owning slices whose data still dies with a region.
@@ -151,7 +176,8 @@ enum class SymbolKind {
   Ctor,        ///< constructor of an inductive type
   IntervalVar, ///< binder introduced by `<i>` or `foreach i in I`
   PatternVar,  ///< binder introduced by a `case` pattern
-  Axiom        ///< erased `axiom` inhabiting `Leak`
+  Axiom,       ///< erased `axiom` inhabiting `Leak`
+  TypeParam    ///< erased type binder `T` in `fn id[T: Type(k)]`
 };
 
 struct Symbol {

@@ -1,0 +1,9 @@
+package identbad
+
+fn id[T: Type(0)](x: T): T
+    ret x
+end
+
+pub fn main(): i32
+    ret id[Type](i32)
+end

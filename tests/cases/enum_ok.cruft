@@ -1,0 +1,16 @@
+package colors
+
+enum Color
+    Red
+    Blue(n: i32)
+end
+
+pub fn main(): i32
+    var c = Blue(2)
+    var n = match c
+        case Red then 0
+        case Blue(k) then k
+    end
+    print(n)
+    ret 0
+end

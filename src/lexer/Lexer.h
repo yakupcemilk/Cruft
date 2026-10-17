@@ -49,6 +49,8 @@ enum class TokenKind {
   KwCofn,
   KwAlong,
   KwAxiom,
+  KwStruct,
+  KwEnum,
 
   // primitive / built-in type names (lexed as keywords so the parser can
   // tell type positions from identifiers without a symbol table)

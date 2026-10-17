@@ -46,7 +46,8 @@ private:
   std::unique_ptr<ast::FnDecl> parseFunction(ast::Visibility vis, bool isExtern, bool isCofn);
   std::unique_ptr<ast::GlobalDecl> parseGlobal(ast::Visibility vis);
   std::unique_ptr<ast::AxiomDecl> parseAxiom(ast::Visibility vis);
-  std::unique_ptr<ast::TypeDecl> parseTypeDecl(ast::Visibility vis);
+  std::unique_ptr<ast::TypeDecl> parseTypeDecl(ast::Visibility vis, bool isEnum);
+  std::unique_ptr<ast::StructDecl> parseStruct(ast::Visibility vis);
   std::vector<ast::Param> parseParamList();
   std::vector<ast::Param> parseLambdaParams();
   [[nodiscard]] bool aheadIsLambda() const;

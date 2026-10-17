@@ -130,6 +130,10 @@ private:
   TypePtr checkArray(ast::ArrayLitExpr &e, const Type *expected);
   TypePtr checkLambda(ast::LambdaExpr &e, const Type *expected);
   TypePtr checkMethod(ast::ExprPtr &e, const Type *expected);
+  TypePtr checkStructCall(ast::CallExpr &call, const Type &structType);
+  TypePtr substTypeVar(const TypePtr &type, const Symbol *var, const TypePtr &replacement) const;
+  [[nodiscard]] int universeOf(const Type &type) const;
+  [[nodiscard]] TypePtr typeOfDenoted(const Type &denoted) const;
 
   /// Lexical regions. Region 0 is the heap: its lifetime witness is a constant
   /// path (normalises to `refl`) and transport along it is the identity.

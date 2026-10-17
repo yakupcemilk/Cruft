@@ -1,0 +1,8 @@
+package univ
+
+pub fn main(): i32
+    const small: Type = i32
+    const upper: Type(1) = i32
+    const kind: Type(1) = Type
+    ret 0
+end
