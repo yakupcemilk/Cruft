@@ -1,0 +1,8 @@
+package alongbad
+
+pub cofn step(n: i32): i32
+    if n == 0 then
+        ret n
+    end
+    step(n - 1) along refl(n)
+end

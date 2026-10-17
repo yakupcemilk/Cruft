@@ -1,0 +1,7 @@
+package elin
+
+extern fn c_id(x: i32): i32
+
+pub fn pass(lin x: i32): i32
+    ret c_id(x)
+end

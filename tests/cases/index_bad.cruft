@@ -1,0 +1,5 @@
+package idxbad
+
+pub fn bad(i: I, p: Path(i32, 0, 1)): i32
+    ret p @ i
+end

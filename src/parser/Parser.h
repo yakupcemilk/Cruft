@@ -43,8 +43,9 @@ private:
 
   // --- declarations ---
   void parseTopLevel(ast::File &file);
-  std::unique_ptr<ast::FnDecl> parseFunction(ast::Visibility vis, bool isExtern);
+  std::unique_ptr<ast::FnDecl> parseFunction(ast::Visibility vis, bool isExtern, bool isCofn);
   std::unique_ptr<ast::GlobalDecl> parseGlobal(ast::Visibility vis);
+  std::unique_ptr<ast::AxiomDecl> parseAxiom(ast::Visibility vis);
   std::unique_ptr<ast::TypeDecl> parseTypeDecl(ast::Visibility vis);
   std::vector<ast::Param> parseParamList();
   std::vector<ast::Param> parseLambdaParams();
@@ -58,6 +59,12 @@ private:
   // --- types ---
   ast::TypeExprPtr parseType();
   [[nodiscard]] bool atTypeStart() const;
+  struct EffectClause {
+    ast::EffectSet effects = 0;
+    std::string var;
+    bool declared = false;
+  };
+  EffectClause parseEffectClause();
 
   // --- expressions (precedence climbing) ---
   ast::ExprPtr parseExpr();
@@ -82,6 +89,8 @@ private:
   std::string filename_;
   DiagnosticEngine &diags_;
   const ast::FnDecl *currentFn_ = nullptr; ///< to know whether `ret` takes a value
+  /// Effect variable in scope while parsing a signature (`fn name[e]`).
+  std::string effectBinder_;
 };
 
 } // namespace cruft

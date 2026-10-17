@@ -428,6 +428,167 @@ def main() -> int:
     link_and_run("slice_at", CASES / "slice_at.cruft", "5", "3", "4")
     ok("Slice.at and Vector.at bounds-checked indexing")
 
+    # ------------------------------------------------------------------
+    # 8. Substructural functions, effects, interval residue, cofn, IFC.
+    # ------------------------------------------------------------------
+    link_and_run("lin_ok", CASES / "lin_ok.cruft", "4", "5")
+    ok("linear values are consumed once, including across branches")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "lin_twice.cruft")],
+        "use of moved value",
+        "linear double use",
+    )
+    ok("linear binding cannot be used twice")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "lin_branch.cruft")],
+        "not used on every path",
+        "linear branch",
+    )
+    ok("linear binding must be used on every path")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "lin_drop.cruft")],
+        "not consumed",
+        "linear drop",
+    )
+    ok("linear binding must be consumed")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "lin_while.cruft")],
+        "cannot be consumed inside a loop",
+        "linear while",
+    )
+    ok("loops cannot consume a linear binding")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "transport_lin.cruft")],
+        "non-refl path",
+        "transport linear",
+    )
+    ok("linear payload cannot be transported along a non-refl path")
+
+    link_and_run("transport_refl_lin", CASES / "transport_refl_lin.cruft", "6")
+    ok("transport of a linear value along refl is the identity")
+
+    link_and_run("index_ok", CASES / "index_ok.cruft", "4")
+    index_ll = out / "index_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(index_ll), str(CASES / "index_ok.cruft")],
+        "index ir",
+    )
+    ir_lacks(index_ll, "Path(", "index: path erased")
+    ok("path-indexed function is constant on I and erased")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "index_bad.cruft")],
+        "changes the computational result",
+        "index dependence",
+    )
+    ok("interval index cannot change a computational result")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "effect_pure.cruft")],
+        "not allowed in this function",
+        "pure effect",
+    )
+    ok("a pure function cannot print")
+
+    link_and_run("effect_io", CASES / "effect_io.cruft", "7")
+    ok("an io row permits print")
+
+    expect_ok([cruftc, "--check", str(CASES / "effect_poly.cruft")], "effect poly")
+    expect_fail(
+        [cruftc, "--check", str(CASES / "effect_poly_bad.cruft")],
+        "not allowed in this function",
+        "effect instantiation",
+    )
+    ok("effect variables instantiate at the call")
+
+    link_and_run("foreach_ok", CASES / "foreach_ok.cruft", "4")
+    foreach_ll = out / "foreach_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(foreach_ll), str(CASES / "foreach_ok.cruft")],
+        "foreach ir",
+    )
+    ir_lacks(foreach_ll, "Path(", "foreach: interval erased")
+    ok("foreach i in I erases to one residue")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "foreach_bad.cruft")],
+        "changes the computational result",
+        "foreach face",
+    )
+    ok("foreach rejects a face-dependent residue")
+
+    link_and_run("cofn_ok", CASES / "cofn_ok.cruft", "0")
+    cofn_ll = out / "cofn_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(cofn_ll), str(CASES / "cofn_ok.cruft")],
+        "cofn ir",
+    )
+    ir_has(cofn_ll, "cofn.loop", "cofn: tail call is a loop")
+    ok("cofn lowers a tail call to a loop")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "cofn_bad.cruft")],
+        "fixed-size",
+        "cofn vector state",
+    )
+    ok("cofn state must be fixed-size")
+
+    link_and_run("cofn_along", CASES / "cofn_along.cruft", "2")
+    ok("cofn along accepts a refl step")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "cofn_along_bad.cruft")],
+        "cofn step",
+        "cofn along mismatch",
+    )
+    ok("cofn along requires a path between the old and new state")
+
+    link_and_run("secret_ok", CASES / "secret_ok.cruft", "41")
+    secret_ll = out / "secret_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(secret_ll), str(CASES / "secret_ok.cruft")],
+        "secret ir",
+    )
+    ir_lacks(secret_ll, "Secret", "secret: label erased")
+    ir_lacks(secret_ll, "Leak", "secret: leak proof erased")
+    ok("reveal along a Leak axiom erases the proof")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "secret_block.cruft")],
+        "PathObstructionError",
+        "secret downgrade",
+    )
+    ok("a secret cannot flow to a public binding")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "secret_io.cruft")],
+        "PathObstructionError",
+        "secret print",
+    )
+    ok("a secret cannot be printed")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "extern_lin.cruft")],
+        "linear value cannot cross",
+        "extern linear",
+    )
+    ok("a linear value cannot cross extern")
+
+    expect_ok([cruftc, "--check", str(CASES / "quotient_ok.cruft")], "quotient check")
+    quot_ll = out / "quotient_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(quot_ll), str(CASES / "quotient_ok.cruft")],
+        "quotient ir",
+    )
+    ir_has(quot_ll, "canon", "quotient: canon is called")
+    ir_lacks(quot_ll, "Quotient", "quotient: no setoid in the IR")
+    ok("quotient values lower as the canon of the carrier")
+
     print(f"\n{passed} tests passed")
     return 0
 

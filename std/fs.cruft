@@ -17,11 +17,11 @@ extern fn cruft_ftell(stream: ptr): i64
 extern fn cruft_fclose(stream: ptr): i32
 extern fn cruft_exists(path: ptr): i32
 
-pub fn exists(path: str): bool
+pub fn exists(path: str): bool ! {io}
     ret cruft_exists(path.data()) != 0
 end
 
-pub fn write_file(path: str, content: str): bool
+pub fn write_file(path: str, content: str): bool ! {io}
     var file: ptr = cruft_fopen(path.data(), "wb".data())
     if file == null() then
         ret false
@@ -35,7 +35,7 @@ pub fn write_file(path: str, content: str): bool
     ret got == n
 end
 
-pub fn read_to_string(path: str): String
+pub fn read_to_string(path: str): String ! {io, alloc}
     var file: ptr = cruft_fopen(path.data(), "rb".data())
     if file == null() then
         ret ""

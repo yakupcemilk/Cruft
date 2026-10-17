@@ -137,10 +137,14 @@ llvm::Type *CodeGen::lower(const Type &t) {
     }
     return it->second;
   }
+  case TypeKind::Labeled:
+  case TypeKind::Quotient:
+    return t.elem ? lower(*t.elem) : nullptr;
   case TypeKind::Interval:
   case TypeKind::Universe:
   case TypeKind::Path:
   case TypeKind::Equiv:
+  case TypeKind::Leak:
     return nullptr; // erased
   case TypeKind::Error:
     return nullptr;
@@ -404,32 +408,49 @@ void CodeGen::defineFunction(const FnDecl &fn) {
   // Owned parameters are the callee's. Park them in allocas so a later
   // `ret` can move one out and drop whatever remains, including strings.
   dropStacks_.emplace_back();
+  cofn_ = fn.isCofn;
+  cofnParams_.clear();
+  if (fn.isCofn)
+    cofnHeader_ = llvm::BasicBlock::Create(*ctx_, "cofn.loop", f);
   unsigned argIndex = 0;
   for (size_t p = 0; p < fn.params.size(); ++p) {
     const Symbol *ps = sym.type->paramSymbols[p];
     if (!ps || !lower(*sym.type->params[p]))
       continue;
     llvm::Argument *arg = f->getArg(argIndex++);
-    if (ps->type && ps->type->isStorage()) {
+    if (fn.isCofn || (ps->type && ps->type->isStorage())) {
       llvm::AllocaInst *slot = createEntryAlloca(lower(*ps->type), ps->name);
       builder_->CreateStore(arg, slot);
       locals_[ps] = slot;
-      dropStacks_.back().push_back(ps);
+      if (ps->type && ps->type->isStorage())
+        dropStacks_.back().push_back(ps);
+      if (fn.isCofn)
+        cofnParams_.push_back(ps);
     } else {
       values_[ps] = arg;
     }
+  }
+
+  if (fn.isCofn) {
+    builder_->CreateBr(cofnHeader_);
+    builder_->SetInsertPoint(cofnHeader_);
   }
 
   genBlock(fn.body);
 
   if (!blockTerminated()) {
     emitDrops(dropStacks_.back());
-    if (currentRet_->kind == TypeKind::Void || !lower(*currentRet_))
+    if (fn.isCofn)
+      builder_->CreateUnreachable();
+    else if (currentRet_->kind == TypeKind::Void || !lower(*currentRet_))
       builder_->CreateRetVoid();
     else
       builder_->CreateUnreachable(); // checker proved all paths return
   }
   dropStacks_.pop_back();
+  cofn_ = false;
+  cofnHeader_ = nullptr;
+  cofnParams_.clear();
   currentFn_ = nullptr;
   currentRet_ = nullptr;
 }
@@ -567,6 +588,9 @@ void CodeGen::genStmt(const Stmt &stmt) {
     builder_->SetInsertPoint(endBB);
     return;
   }
+  case StmtKind::Foreach:
+    genBlock(static_cast<const ForeachStmt &>(stmt).body);
+    return;
   case StmtKind::Expr:
     gen(*static_cast<const ExprStmt &>(stmt).expr);
     return;
@@ -727,6 +751,27 @@ llvm::Value *CodeGen::genUnary(const UnaryExpr &e) {
 }
 
 llvm::Value *CodeGen::genCall(const CallExpr &e) {
+  if (e.tailSelf && cofnHeader_) {
+    const Type *fnType = e.fn && e.fn->type ? e.fn->type.get() : e.callee->type.get();
+    std::vector<llvm::Value *> incoming;
+    if (fnType) {
+      for (size_t i = 0; i < e.args.size() && i < fnType->params.size(); ++i) {
+        llvm::Value *v = e.args[i] ? gen(*e.args[i]) : nullptr;
+        if (fnType->params[i] && lower(*fnType->params[i]))
+          incoming.push_back(v);
+      }
+    }
+    for (size_t i = 0; i < cofnParams_.size() && i < incoming.size(); ++i) {
+      if (!incoming[i])
+        continue;
+      auto slot = locals_.find(cofnParams_[i]);
+      if (slot != locals_.end())
+        builder_->CreateStore(incoming[i], slot->second);
+    }
+    builder_->CreateBr(cofnHeader_);
+    return nullptr;
+  }
+
   if (e.builtin != Builtin::None)
     return genBuiltin(e);
 
@@ -810,6 +855,21 @@ llvm::Value *CodeGen::genBuiltin(const CallExpr &e) {
     slice = builder_->CreateInsertValue(slice, ptr, 0);
     slice = builder_->CreateInsertValue(slice, len, 1);
     return slice;
+  }
+  case Builtin::Seal:
+  case Builtin::Reveal:
+    return e.args.empty() ? nullptr : gen(*e.args[0]);
+  case Builtin::Quot: {
+    llvm::Value *payload = e.args.empty() ? nullptr : gen(*e.args[0]);
+    if (!e.quotCanon)
+      return payload;
+    auto it = functions_.find(e.quotCanon);
+    if (it == functions_.end() || !payload)
+      return payload;
+    llvm::CallInst *call =
+        builder_->CreateCall(it->second->getFunctionType(), it->second, {payload}, "canon");
+    call->setCallingConv(llvm::CallingConv::C);
+    return call;
   }
   case Builtin::Refl:
   case Builtin::Sym:

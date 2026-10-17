@@ -71,14 +71,50 @@ TypePtr Type::equiv(TypePtr a, TypePtr b) {
 }
 
 TypePtr Type::fn(std::vector<TypePtr> params, std::vector<const Symbol *> paramSymbols,
-                 TypePtr ret) {
+                 TypePtr ret, std::vector<ast::Usage> paramUse, ast::EffectSet effects,
+                 std::string effectVar, bool effectsDeclared) {
   auto t = std::make_shared<Type>();
   t->kind = TypeKind::Fn;
   t->params = std::move(params);
   t->paramSymbols = std::move(paramSymbols);
   if (t->paramSymbols.size() < t->params.size())
     t->paramSymbols.resize(t->params.size(), nullptr);
+  t->paramUse = std::move(paramUse);
+  if (t->paramUse.size() < t->params.size())
+    t->paramUse.resize(t->params.size(), ast::Usage::Many);
   t->ret = std::move(ret);
+  t->effects = effects;
+  t->effectVar = std::move(effectVar);
+  t->effectsDeclared = effectsDeclared;
+  return t;
+}
+
+TypePtr Type::labeled(TypePtr elem, ast::Secrecy secrecy) {
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::Labeled;
+  t->elem = std::move(elem);
+  t->secrecy = secrecy;
+  t->region = t->elem ? t->elem->region : 0;
+  return t;
+}
+
+TypePtr Type::leak(ast::Secrecy from, ast::Secrecy to) {
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::Leak;
+  t->secrecy = from;
+  t->secrecyTo = to;
+  return t;
+}
+
+TypePtr Type::quotient(TypePtr carrier, ast::ExprPtr rel, ast::ExprPtr canon,
+                       const Symbol *canonFn) {
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::Quotient;
+  t->elem = std::move(carrier);
+  t->lhs = std::move(rel);
+  t->rhs = std::move(canon);
+  t->canonFn = canonFn;
+  t->region = t->elem ? t->elem->region : 0;
   return t;
 }
 
@@ -140,7 +176,10 @@ bool Type::isCCompatible() const {
     for (const auto &p : params)
       if (!p->isCCompatible())
         return false;
-    return ret->isCCompatible();
+    for (ast::Usage u : paramUse)
+      if (u == ast::Usage::Linear)
+        return false;
+    return ret && ret->isCCompatible();
   case TypeKind::Slice:
     return elem && elem->isCCompatible();
   default:
@@ -169,6 +208,10 @@ std::string Type::str() const {
     for (size_t i = 0; i < params.size(); ++i) {
       if (i)
         s += ", ";
+      if (i < paramUse.size() && paramUse[i] == ast::Usage::Linear)
+        s += "lin ";
+      else if (i < paramUse.size() && paramUse[i] == ast::Usage::Affine)
+        s += "aff ";
       if (paramSymbols[i])
         s += paramSymbols[i]->name + ": ";
       s += params[i]->str();
@@ -176,8 +219,37 @@ std::string Type::str() const {
     s += ")";
     if (ret && ret->kind != TypeKind::Void)
       s += ": " + ret->str();
+    if (effectsDeclared) {
+      s += " ! ";
+      if (!effectVar.empty() && effects == 0)
+        s += effectVar;
+      else {
+        s += "{";
+        bool first = true;
+        auto bit = [&](ast::EffectSet b, const char *name) {
+          if ((effects & b) == 0)
+            return;
+          if (!first)
+            s += ", ";
+          first = false;
+          s += name;
+        };
+        bit(ast::effectIo, "io");
+        bit(ast::effectAlloc, "alloc");
+        bit(ast::effectNet, "net");
+        s += "}";
+      }
+    }
     return s;
   }
+  case TypeKind::Labeled:
+    return std::string(secrecy == ast::Secrecy::Private ? "Private(" : "Secret(") +
+           (elem ? elem->str() : "?") + ")";
+  case TypeKind::Leak:
+    return std::string("Leak(") + ast::secrecyName(secrecy) + ", " + ast::secrecyName(secrecyTo) +
+           ")";
+  case TypeKind::Quotient:
+    return "Quotient(" + (elem ? elem->str() : std::string("?")) + ")";
   case TypeKind::Inductive:
     return inductive ? inductive->qualifiedName() : "<inductive>";
   case TypeKind::Vector:

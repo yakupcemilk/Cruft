@@ -1,0 +1,13 @@
+package countdown
+
+pub cofn down(n: i32): i32
+    if n <= 0 then
+        ret 0
+    end
+    down(n - 1)
+end
+
+pub fn main(): i32
+    print(down(4))
+    ret 0
+end

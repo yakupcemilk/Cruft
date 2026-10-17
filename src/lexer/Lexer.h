@@ -43,6 +43,12 @@ enum class TokenKind {
   KwArena,
   KwOwned,  ///< explicit (and default) linear ownership
   KwShared, ///< reference-counted multi-ownership
+  KwLin,    ///< exactly-once parameter or local
+  KwAff,    ///< at-most-once parameter or local
+  KwForeach,
+  KwCofn,
+  KwAlong,
+  KwAxiom,
 
   // primitive / built-in type names (lexed as keywords so the parser can
   // tell type positions from identifiers without a symbol table)
@@ -81,6 +87,7 @@ enum class TokenKind {
   Percent,
   EqEq,         ///< ==
   BangEq,       ///< !=
+  Bang,         ///< !   effect row on a function type
   Less,         ///< <   (also opens a path abstraction `<i> e`)
   LessEq,
   Greater,      ///< >

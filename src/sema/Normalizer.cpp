@@ -238,7 +238,7 @@ bool Normalizer::mentions(const Expr &e, const Symbol *var) {
     for (const auto &a : c.args)
       if (mentions(*a, var))
         return true;
-    return false;
+    return c.along && mentions(*c.along, var);
   }
   case ExprKind::PathAbs:
     return mentions(*as<PathAbsExpr>(e).body, var);
@@ -386,7 +386,14 @@ ExprPtr Normalizer::substitute(const Expr &e, const Symbol *var, const Expr &wit
     n->fn = c.fn;
     n->transportDir = c.transportDir;
     n->transportFn = c.transportFn;
+    n->quotCanon = c.quotCanon;
+    n->tailSelf = c.tailSelf;
+    n->hasEffectInst = c.hasEffectInst;
+    n->effectInst = c.effectInst;
+    if (c.along)
+      n->along = substitute(*c.along, var, with);
     n->type = substituteType(e.type, var, with);
+    n->flow = e.flow;
     return n;
   }
   case ExprKind::PathAbs: {
@@ -510,8 +517,27 @@ TypePtr Normalizer::substituteType(const TypePtr &t, const Symbol *var, const Ex
     changed |= ret != t->ret;
     if (!changed)
       return t;
-    return Type::fn(std::move(params), t->paramSymbols, std::move(ret));
+    return Type::fn(std::move(params), t->paramSymbols, std::move(ret), t->paramUse, t->effects,
+                    t->effectVar, t->effectsDeclared);
   }
+  case TypeKind::Labeled: {
+    TypePtr elem = substituteType(t->elem, var, with);
+    if (elem == t->elem)
+      return t;
+    return Type::labeled(std::move(elem), t->secrecy);
+  }
+  case TypeKind::Quotient: {
+    TypePtr elem = substituteType(t->elem, var, with);
+    bool lhsMentions = t->lhs && mentions(*t->lhs, var);
+    bool rhsMentions = t->rhs && mentions(*t->rhs, var);
+    if (elem == t->elem && !lhsMentions && !rhsMentions)
+      return t;
+    return Type::quotient(std::move(elem),
+                          t->lhs ? substitute(*t->lhs, var, with) : nullptr,
+                          t->rhs ? substitute(*t->rhs, var, with) : nullptr, t->canonFn);
+  }
+  case TypeKind::Leak:
+    return t;
   default:
     return t;
   }
@@ -693,6 +719,12 @@ bool Normalizer::typeEqualImpl(const Type &a, const Type &b, BinderMap &binders)
     return true;
   case TypeKind::Slice:
     return a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
+  case TypeKind::Labeled:
+    return a.secrecy == b.secrecy && a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
+  case TypeKind::Leak:
+    return a.secrecy == b.secrecy && a.secrecyTo == b.secrecyTo;
+  case TypeKind::Quotient:
+    return a.canonFn == b.canonFn && a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
   default:
     return true; // primitives: same kind means same type
   }
@@ -1021,7 +1053,14 @@ ExprPtr Normalizer::normCall(const CallExpr &e) {
     n->fn = e.fn;
     n->transportDir = e.transportDir;
     n->transportFn = e.transportFn;
+    n->quotCanon = e.quotCanon;
+    n->tailSelf = e.tailSelf;
+    n->hasEffectInst = e.hasEffectInst;
+    n->effectInst = e.effectInst;
+    if (e.along)
+      n->along = e.along->clone();
     n->type = e.type;
+    n->flow = e.flow;
     return n;
   };
 

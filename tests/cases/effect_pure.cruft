@@ -1,0 +1,6 @@
+package pure
+
+pub fn bad(): i32 ! {}
+    print(1)
+    ret 0
+end

@@ -151,6 +151,9 @@ private:
   int arenaDepth_ = 0;
   std::vector<std::vector<const sema::Symbol *>> dropStacks_;
   bool consume_ = true;
+  bool cofn_ = false;
+  llvm::BasicBlock *cofnHeader_ = nullptr;
+  std::vector<const sema::Symbol *> cofnParams_;
   int lambdaSeq_ = 0;
 };
 

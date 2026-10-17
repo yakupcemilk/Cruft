@@ -57,12 +57,16 @@ TypeExprPtr TypeExpr::clone() const {
     t->params.push_back(p->clone());
   if (ret)
     t->ret = ret->clone();
+  t->effects = effects;
+  t->effectVar = effectVar;
+  t->effectsDeclared = effectsDeclared;
   return t;
 }
 
 namespace {
 template <class T> std::unique_ptr<T> withType(std::unique_ptr<T> n, const Expr &src) {
   n->type = src.type;
+  n->flow = src.flow;
   return n;
 }
 } // namespace
@@ -94,6 +98,12 @@ ExprPtr CallExpr::clone() const {
   n->fn = fn;
   n->transportDir = transportDir;
   n->transportFn = transportFn;
+  n->quotCanon = quotCanon;
+  n->tailSelf = tailSelf;
+  n->hasEffectInst = hasEffectInst;
+  n->effectInst = effectInst;
+  if (along)
+    n->along = along->clone();
   return withType(std::move(n), *this);
 }
 
@@ -393,6 +403,39 @@ void print(std::ostream &os, const TypeExpr &t) {
       os << ": ";
       print(os, *t.ret);
     }
+    if (t.effectsDeclared) {
+      os << " ! ";
+      if (!t.effectVar.empty())
+        os << t.effectVar;
+      else {
+        os << '{';
+        bool first = true;
+        auto bit = [&](EffectSet b, const char *name) {
+          if ((t.effects & b) == 0)
+            return;
+          if (!first)
+            os << ", ";
+          first = false;
+          os << name;
+        };
+        bit(effectIo, "io");
+        bit(effectAlloc, "alloc");
+        bit(effectNet, "net");
+        os << '}';
+      }
+    }
+    break;
+  case TypeExprKind::Quotient:
+    os << "Quotient(";
+    if (t.elem)
+      print(os, *t.elem);
+    os << ", ";
+    if (t.lhs)
+      print(os, *t.lhs);
+    os << ", ";
+    if (t.rhs)
+      print(os, *t.rhs);
+    os << ')';
     break;
   }
 }

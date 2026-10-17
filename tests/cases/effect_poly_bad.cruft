@@ -1,0 +1,14 @@
+package epolybad
+
+fn apply[e](f: fn(i32): i32 ! e, x: i32): i32 ! e
+    ret f(x)
+end
+
+fn loud(x: i32): i32 ! {io}
+    print(x)
+    ret x
+end
+
+pub fn quiet(x: i32): i32 ! {}
+    ret apply[{io}](loud, x)
+end

@@ -1,0 +1,10 @@
+package feach
+
+pub fn main(): i32
+    var n: i32 = 0
+    foreach i in I do
+        n = 4
+    end
+    print(n)
+    ret 0
+end

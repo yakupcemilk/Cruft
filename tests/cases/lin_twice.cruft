@@ -1,0 +1,6 @@
+package lintwice
+
+pub fn bad(lin x: i32): i32
+    var y: i32 = x
+    ret x
+end

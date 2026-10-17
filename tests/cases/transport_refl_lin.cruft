@@ -1,0 +1,11 @@
+package trefl
+
+pub fn keep(lin x: i32): i32
+    const idT: Path(Type, i32, i32) = refl(i32)
+    ret transport(idT, x)
+end
+
+pub fn main(): i32
+    print(keep(6))
+    ret 0
+end
