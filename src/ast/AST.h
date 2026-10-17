@@ -109,6 +109,8 @@ struct TypeExpr {
   EffectSet effects = 0;
   std::string effectVar;
   bool effectsDeclared = false;
+  /// `Type(n)`. Bare `Type` is level 0.
+  int level = 0;
 
   explicit TypeExpr(TypeExprKind k, SourceLocation l) : kind(k), loc(std::move(l)) {}
   [[nodiscard]] TypeExprPtr clone() const;
@@ -165,7 +167,8 @@ enum class Builtin {
   AllocString, ///< alloc_string(nbytes) : String  (heap, NUL-terminated)
   Seal,        ///< seal(x) : Secret(T)
   Reveal,      ///< reveal(s, p) : T   where p : Leak(label(s), Public)
-  Quot         ///< quot(x, p) : Quotient(T, rel, canon)
+  Quot,        ///< quot(x, p) : Quotient(T, rel, canon)
+  Text         ///< text("...") : Text
 };
 
 /// How a `transport` call computes once its type path has been normalised.
@@ -240,6 +243,9 @@ struct CallExpr final : Expr {
   bool tailSelf = false;                     ///< cofn tail call, lowered to a back-edge
   bool hasEffectInst = false;                ///< `f[{io}](...)`
   EffectSet effectInst = 0;
+  bool hasTypeArg = false;                   ///< `id[i32](...)`
+  TypeExprPtr typeArg;
+  TypeRef typeArgument;                      ///< resolved type argument
 
   CallExpr(SourceLocation l, ExprPtr c, std::vector<ExprPtr> a)
       : Expr(ExprKind::Call, std::move(l)), callee(std::move(c)), args(std::move(a)) {}
@@ -479,6 +485,8 @@ struct FnDecl {
   std::string effectVar; ///< binder from `fn name[e]`
   EffectSet effects = 0;
   bool effectsDeclared = false;
+  std::string typeParam;       ///< binder from `fn name[T: Type(k)]`
+  TypeExprPtr typeParamBound;  ///< the `Type(k)` written on the binder
   std::vector<Param> params;
   TypeExprPtr ret; ///< null => void
   Block body;      ///< empty for extern declarations
@@ -518,8 +526,18 @@ struct CtorDecl {
 
 struct TypeDecl {
   Visibility visibility = Visibility::Private;
+  bool isEnum = false; ///< point constructors only; no path constructors
   std::string name;
   std::vector<CtorDecl> ctors;
+  SourceLocation loc;
+  sema::Symbol *symbol = nullptr;
+};
+
+/// Untagged product. A later field's type may mention an earlier field.
+struct StructDecl {
+  Visibility visibility = Visibility::Private;
+  std::string name;
+  std::vector<Param> fields;
   SourceLocation loc;
   sema::Symbol *symbol = nullptr;
 };
@@ -557,6 +575,7 @@ struct File {
   std::vector<UseBinding> uses;
   std::vector<ExportDecl> exports;
   std::vector<std::unique_ptr<TypeDecl>> types;
+  std::vector<std::unique_ptr<StructDecl>> structs;
   std::vector<std::unique_ptr<GlobalDecl>> globals;
   std::vector<std::unique_ptr<AxiomDecl>> axioms;
   std::vector<std::unique_ptr<FnDecl>> functions;

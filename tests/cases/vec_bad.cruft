@@ -1,0 +1,6 @@
+package vecbad
+
+pub fn main(): i32
+    var v: Vec(i32, 2) = [4]
+    ret 0
+end

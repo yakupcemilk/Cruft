@@ -60,6 +60,7 @@ TypeExprPtr TypeExpr::clone() const {
   t->effects = effects;
   t->effectVar = effectVar;
   t->effectsDeclared = effectsDeclared;
+  t->level = level;
   return t;
 }
 
@@ -102,6 +103,10 @@ ExprPtr CallExpr::clone() const {
   n->tailSelf = tailSelf;
   n->hasEffectInst = hasEffectInst;
   n->effectInst = effectInst;
+  n->hasTypeArg = hasTypeArg;
+  n->typeArgument = typeArgument;
+  if (typeArg)
+    n->typeArg = typeArg->clone();
   if (along)
     n->along = along->clone();
   return withType(std::move(n), *this);

@@ -128,7 +128,30 @@ llvm::Type *CodeGen::lower(const Type &t) {
   case TypeKind::Vector:
   case TypeKind::Map:
   case TypeKind::String: return bufferType();
-  case TypeKind::Slice: return sliceType();
+  case TypeKind::Slice:
+  case TypeKind::Text: return sliceType();
+  case TypeKind::TyVar: {
+    auto it = tySubst_.find(t.tyVar);
+    if (it != tySubst_.end() && it->second)
+      return lower(*it->second);
+    return nullptr;
+  }
+  case TypeKind::Struct: {
+    if (!t.inductive)
+      return nullptr;
+    auto found = inductives_.find(t.inductive);
+    if (found != inductives_.end())
+      return found->second;
+    auto *sty = llvm::StructType::create(*ctx_, t.inductive->qualifiedName());
+    inductives_[t.inductive] = sty;
+    std::vector<llvm::Type *> fields;
+    for (const auto &field : t.params)
+      if (field)
+        if (llvm::Type *ft = lower(*field))
+          fields.push_back(ft);
+    sty->setBody(fields);
+    return sty;
+  }
   case TypeKind::Inductive: {
     auto it = inductives_.find(t.inductive);
     if (it == inductives_.end()) {
@@ -326,6 +349,8 @@ void CodeGen::applyBoolAttributes(llvm::Function &f, const Type &fnType) {
 
 void CodeGen::declareFunction(const FnDecl &fn) {
   const Symbol &sym = *fn.symbol;
+  if (sym.type && sym.type->typeParam)
+    return; // specialized at each call
   llvm::FunctionType *fty = lowerFnType(*sym.type);
   llvm::GlobalValue::LinkageTypes linkage =
       (sym.isExtern || sym.visibility == Visibility::Public) ? llvm::Function::ExternalLinkage
@@ -395,6 +420,8 @@ llvm::AllocaInst *CodeGen::createEntryAlloca(llvm::Type *ty, const std::string &
 
 void CodeGen::defineFunction(const FnDecl &fn) {
   const Symbol &sym = *fn.symbol;
+  if (sym.type && sym.type->typeParam)
+    return; // specialized at each call
   llvm::Function *f = functions_.at(&sym);
   currentFn_ = f;
   currentRet_ = sym.type->ret.get();
@@ -750,7 +777,129 @@ llvm::Value *CodeGen::genUnary(const UnaryExpr &e) {
   return nullptr;
 }
 
+int CodeGen::runtimeField(const Type &structType, size_t field) {
+  int index = 0;
+  for (size_t i = 0; i < field && i < structType.params.size(); ++i)
+    if (structType.params[i] && lower(*structType.params[i]))
+      ++index;
+  return index;
+}
+
+llvm::Function *CodeGen::specialize(const FnDecl &fn, const sema::TypePtr &arg) {
+  const Symbol &sym = *fn.symbol;
+  std::string key = sym.linkName + "/" + (arg ? arg->str() : "?");
+  if (auto it = specs_.find(key); it != specs_.end())
+    return it->second;
+  auto savedSubst = tySubst_;
+  if (sym.type && sym.type->typeParam)
+    tySubst_[sym.type->typeParam] = arg;
+  llvm::FunctionType *fty = lowerFnType(*sym.type);
+  llvm::Function *f = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
+                                             sym.linkName + ".spec", module_.get());
+  f->setCallingConv(llvm::CallingConv::C);
+  f->addFnAttr(llvm::Attribute::NoUnwind);
+  specs_[key] = f;
+
+  llvm::Function *savedFn = currentFn_;
+  const Type *savedRet = currentRet_;
+  llvm::BasicBlock *savedBB = builder_->GetInsertBlock();
+  auto savedValues = values_;
+  auto savedLocals = locals_;
+  bool savedConsume = consume_;
+  auto savedDrops = dropStacks_;
+  bool savedCofn = cofn_;
+  llvm::BasicBlock *savedHeader = cofnHeader_;
+  auto savedCofnParams = cofnParams_;
+  values_.clear();
+  locals_.clear();
+  dropStacks_.clear();
+  cofn_ = false;
+  cofnHeader_ = nullptr;
+  cofnParams_.clear();
+  currentFn_ = f;
+  currentRet_ = sym.type->ret.get();
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(*ctx_, "entry", f);
+  builder_->SetInsertPoint(entry);
+  dropStacks_.emplace_back();
+  unsigned argIndex = 0;
+  for (size_t p = 0; p < fn.params.size(); ++p) {
+    const Symbol *ps = sym.type->paramSymbols[p];
+    if (!ps || !sym.type->params[p] || !lower(*sym.type->params[p]))
+      continue;
+    llvm::Argument *argument = f->getArg(argIndex++);
+    argument->setName(fn.params[p].name);
+    if (ps->type && ps->type->isStorage()) {
+      llvm::AllocaInst *slot = createEntryAlloca(lower(*sym.type->params[p]), ps->name);
+      builder_->CreateStore(argument, slot);
+      locals_[ps] = slot;
+      dropStacks_.back().push_back(ps);
+    } else {
+      values_[ps] = argument;
+    }
+  }
+  genBlock(fn.body);
+  if (!blockTerminated()) {
+    emitDrops(dropStacks_.back());
+    if (!sym.type->ret || sym.type->ret->kind == TypeKind::Void || !lower(*sym.type->ret))
+      builder_->CreateRetVoid();
+    else
+      builder_->CreateUnreachable();
+  }
+  dropStacks_.pop_back();
+  currentFn_ = savedFn;
+  currentRet_ = savedRet;
+  values_ = std::move(savedValues);
+  locals_ = std::move(savedLocals);
+  dropStacks_ = std::move(savedDrops);
+  consume_ = savedConsume;
+  cofn_ = savedCofn;
+  cofnHeader_ = savedHeader;
+  cofnParams_ = std::move(savedCofnParams);
+  tySubst_ = std::move(savedSubst);
+  if (savedBB)
+    builder_->SetInsertPoint(savedBB);
+  return f;
+}
+
+llvm::Value *CodeGen::genStruct(const CallExpr &e) {
+  const Type &st = *e.fn->type;
+  llvm::Type *lt = lower(st);
+  if (!lt)
+    return nullptr;
+  llvm::Value *agg = llvm::UndefValue::get(lt);
+  unsigned slot = 0;
+  for (size_t i = 0; i < e.args.size() && i < st.params.size(); ++i) {
+    if (!st.params[i] || !lower(*st.params[i]))
+      continue;
+    llvm::Value *field = e.args[i] ? gen(*e.args[i]) : nullptr;
+    if (field)
+      agg = builder_->CreateInsertValue(agg, field, slot);
+    ++slot;
+  }
+  return agg;
+}
+
 llvm::Value *CodeGen::genCall(const CallExpr &e) {
+  if (e.fn && e.fn->type && e.fn->type->kind == TypeKind::Struct)
+    return genStruct(e);
+  if (e.fn && e.fn->fnDecl && e.fn->type && e.fn->type->typeParam && e.typeArgument) {
+    llvm::Function *spec = specialize(*e.fn->fnDecl, e.typeArgument);
+    std::vector<llvm::Value *> args;
+    for (size_t i = 0; i < e.args.size() && i < e.fn->type->params.size(); ++i) {
+      auto saved = tySubst_;
+      tySubst_[e.fn->type->typeParam] = e.typeArgument;
+      bool keep = e.fn->type->params[i] && lower(*e.fn->type->params[i]);
+      llvm::Value *v = e.args[i] ? gen(*e.args[i]) : nullptr;
+      tySubst_ = std::move(saved);
+      if (keep && v)
+        args.push_back(v);
+    }
+    llvm::CallInst *call = builder_->CreateCall(spec->getFunctionType(), spec, args);
+    call->setCallingConv(llvm::CallingConv::C);
+    if (spec->getReturnType()->isVoidTy())
+      return nullptr;
+    return call;
+  }
   if (e.tailSelf && cofnHeader_) {
     const Type *fnType = e.fn && e.fn->type ? e.fn->type.get() : e.callee->type.get();
     std::vector<llvm::Value *> incoming;
@@ -859,6 +1008,18 @@ llvm::Value *CodeGen::genBuiltin(const CallExpr &e) {
   case Builtin::Seal:
   case Builtin::Reveal:
     return e.args.empty() ? nullptr : gen(*e.args[0]);
+  case Builtin::Text: {
+    if (e.args.empty() || e.args[0]->kind != ExprKind::StringLit)
+      return nullptr;
+    const auto &lit = as<StringLitExpr>(*e.args[0]);
+    auto *i64 = llvm::Type::getInt64Ty(*ctx_);
+    llvm::Value *data = globalString(lit.value, ".text.lit");
+    llvm::Value *n = llvm::ConstantInt::get(i64, lit.value.size());
+    llvm::Value *text = llvm::UndefValue::get(sliceType());
+    text = builder_->CreateInsertValue(text, data, 0);
+    text = builder_->CreateInsertValue(text, n, 1);
+    return text;
+  }
   case Builtin::Quot: {
     llvm::Value *payload = e.args.empty() ? nullptr : gen(*e.args[0]);
     if (!e.quotCanon)
@@ -1190,6 +1351,39 @@ void CodeGen::dropSlot(const Symbol &sym) {
   auto found = locals_.find(&sym);
   if (found == locals_.end())
     return;
+  if (sym.type->kind == TypeKind::Struct) {
+    llvm::Type *sty = lower(*sym.type);
+    if (!sty)
+      return;
+    llvm::Value *aggregate = builder_->CreateLoad(sty, found->second, "drop.struct");
+    auto *i64 = llvm::Type::getInt64Ty(*ctx_);
+    auto *nullPtr = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(*ctx_));
+    unsigned slot = 0;
+    for (const auto &field : sym.type->params) {
+      if (!field || !lower(*field))
+        continue;
+      if (field->kind == TypeKind::Vector || field->kind == TypeKind::String ||
+          field->kind == TypeKind::Map) {
+        llvm::Value *buf = builder_->CreateExtractValue(aggregate, slot, "drop.field");
+        llvm::Value *data = builder_->CreateExtractValue(buf, 0, "drop.data");
+        llvm::Value *cap = builder_->CreateExtractValue(buf, 2, "drop.cap");
+        llvm::Value *owned = builder_->CreateAnd(
+            builder_->CreateICmpNE(data, nullPtr),
+            builder_->CreateICmpSGE(cap, llvm::ConstantInt::get(i64, 0)));
+        llvm::BasicBlock *freeBB = llvm::BasicBlock::Create(*ctx_, "drop.struct.free", currentFn_);
+        llvm::BasicBlock *nextBB = llvm::BasicBlock::Create(*ctx_, "drop.struct.next", currentFn_);
+        builder_->CreateCondBr(owned, freeBB, nextBB);
+        builder_->SetInsertPoint(freeBB);
+        if (field->region == 0)
+          heapFree(data);
+        builder_->CreateBr(nextBB);
+        builder_->SetInsertPoint(nextBB);
+      }
+      ++slot;
+    }
+    builder_->CreateStore(llvm::ConstantAggregateZero::get(sty), found->second);
+    return;
+  }
   auto *i64 = llvm::Type::getInt64Ty(*ctx_);
   auto *ptrTy = llvm::PointerType::getUnqual(*ctx_);
   auto *nullPtr = llvm::ConstantPointerNull::get(ptrTy);
@@ -1329,6 +1523,32 @@ llvm::Value *CodeGen::genMethod(const MethodCallExpr &m) {
   auto lengthOf = [&](llvm::Value *buf) {
     return builder_->CreateTrunc(builder_->CreateExtractValue(buf, 1, "len64"), i32, "len");
   };
+
+  if (recvTy.kind == TypeKind::Struct && !m.invoked) {
+    for (size_t i = 0; i < recvTy.params.size(); ++i) {
+      const Symbol *field = i < recvTy.paramSymbols.size() ? recvTy.paramSymbols[i] : nullptr;
+      if (!field || field->name != m.method || !recvTy.params[i])
+        continue;
+      bool storage = recvTy.params[i]->isStorage();
+      if (storage)
+        consume_ = true;
+      llvm::Value *aggregate = gen(*m.receiver);
+      consume_ = saved;
+      if (!aggregate)
+        return nullptr;
+      return builder_->CreateExtractValue(aggregate, static_cast<unsigned>(runtimeField(recvTy, i)),
+                                          m.method);
+    }
+  }
+
+  if (recvTy.kind == TypeKind::Text) {
+    if (!recv)
+      return nullptr;
+    if (m.method == "data")
+      return builder_->CreateExtractValue(recv, 0, "text.data");
+    if (m.method == "length")
+      return builder_->CreateExtractValue(recv, 1, "text.len");
+  }
 
   if (recvTy.kind == TypeKind::Ptr && m.method == "addr")
     return builder_->CreatePtrToInt(recv, i64, "addr");

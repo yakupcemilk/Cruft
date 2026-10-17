@@ -129,6 +129,8 @@ bool Parser::isRecoveryBoundary(TokenKind k, bool topLevel) const {
   case TokenKind::KwAff:
   case TokenKind::KwCofn:
   case TokenKind::KwAxiom:
+  case TokenKind::KwStruct:
+  case TokenKind::KwEnum:
     return true;
   case TokenKind::KwRet:
   case TokenKind::KwIf:
@@ -152,6 +154,8 @@ bool Parser::isTopLevelStart(TokenKind k) const {
   case TokenKind::KwFn:
   case TokenKind::KwCofn:
   case TokenKind::KwAxiom:
+  case TokenKind::KwStruct:
+  case TokenKind::KwEnum:
   case TokenKind::KwType:
   case TokenKind::KwVar:
   case TokenKind::KwConst:
@@ -287,7 +291,15 @@ void Parser::parseTopLevel(File &file) {
   }
   case TokenKind::KwType:
     advance();
-    file.types.push_back(parseTypeDecl(vis));
+    file.types.push_back(parseTypeDecl(vis, /*isEnum=*/false));
+    return;
+  case TokenKind::KwEnum:
+    advance();
+    file.types.push_back(parseTypeDecl(vis, /*isEnum=*/true));
+    return;
+  case TokenKind::KwStruct:
+    advance();
+    file.structs.push_back(parseStruct(vis));
     return;
   default:
     if (shared)
@@ -350,8 +362,15 @@ std::unique_ptr<FnDecl> Parser::parseFunction(Visibility vis, bool isExtern, boo
   fn->loc = peek().loc;
   fn->name = expectIdentifier("as function name");
   if (accept(TokenKind::LBracket)) {
-    fn->effectVar = expectIdentifier("as effect variable");
-    expect(TokenKind::RBracket, "after effect variable");
+    std::string binder = expectIdentifier("as type or effect variable");
+    if (accept(TokenKind::Colon)) {
+      fn->typeParam = std::move(binder);
+      fn->typeParamBound = parseType();
+      expect(TokenKind::RBracket, "after type binder");
+    } else {
+      fn->effectVar = std::move(binder);
+      expect(TokenKind::RBracket, "after effect variable");
+    }
   }
   std::string savedBinder = effectBinder_;
   if (!fn->effectVar.empty())
@@ -404,9 +423,27 @@ std::unique_ptr<GlobalDecl> Parser::parseGlobal(Visibility vis) {
   return g;
 }
 
-std::unique_ptr<TypeDecl> Parser::parseTypeDecl(Visibility vis) {
+std::unique_ptr<StructDecl> Parser::parseStruct(Visibility vis) {
+  auto sd = std::make_unique<StructDecl>();
+  sd->visibility = vis;
+  sd->loc = peek().loc;
+  sd->name = expectIdentifier("as struct name");
+  while (!at(TokenKind::KwEnd) && !at(TokenKind::EndOfFile)) {
+    Param field;
+    field.loc = peek().loc;
+    field.name = expectIdentifier("as field name");
+    expect(TokenKind::Colon, "after field name");
+    field.type = parseType();
+    sd->fields.push_back(std::move(field));
+  }
+  expect(TokenKind::KwEnd, "to close struct");
+  return sd;
+}
+
+std::unique_ptr<TypeDecl> Parser::parseTypeDecl(Visibility vis, bool isEnum) {
   auto td = std::make_unique<TypeDecl>();
   td->visibility = vis;
+  td->isEnum = isEnum;
   td->loc = peek().loc;
   td->name = expectIdentifier("as type name");
   while (!at(TokenKind::KwEnd) && !at(TokenKind::EndOfFile)) {
@@ -437,7 +474,7 @@ Block Parser::parseBlock(std::initializer_list<TokenKind> terminators) {
     if (at(TokenKind::KwPackage) || at(TokenKind::KwImport) || at(TokenKind::KwExport) ||
         at(TokenKind::KwUse) || at(TokenKind::KwPub) || at(TokenKind::KwPri) ||
         at(TokenKind::KwExtern) || at(TokenKind::KwType) || at(TokenKind::KwCofn) ||
-        at(TokenKind::KwAxiom))
+        at(TokenKind::KwAxiom) || at(TokenKind::KwStruct) || at(TokenKind::KwEnum))
       return true;
     if ((at(TokenKind::KwFn) || at(TokenKind::KwCofn)) && !aheadIsLambda())
       return true;
@@ -591,11 +628,27 @@ TypeExprPtr Parser::parseType() {
   case TokenKind::KwF64:
   case TokenKind::KwBool:
   case TokenKind::KwPtr:
-  case TokenKind::KwInterval:
-  case TokenKind::KwUniverse: {
+  case TokenKind::KwInterval: {
     auto t = std::make_unique<TypeExpr>(TypeExprKind::Named, tok.loc);
     t->name = tok.text;
     advance();
+    return t;
+  }
+  case TokenKind::KwUniverse: {
+    auto t = std::make_unique<TypeExpr>(TypeExprKind::Named, tok.loc);
+    t->name = "Type";
+    advance();
+    if (accept(TokenKind::LParen)) {
+      if (!at(TokenKind::IntLiteral))
+        fail(peek(), "expected a universe level, as in Type(1)");
+      int level = 0;
+      auto [ptr, ec] = std::from_chars(peek().text.data(), peek().text.data() + peek().text.size(), level);
+      if (ec != std::errc{} || level < 0)
+        fail(peek(), "universe level must be a non-negative integer");
+      advance();
+      t->level = level;
+      expect(TokenKind::RParen, "to close Type(n)");
+    }
     return t;
   }
   case TokenKind::KwPath: {
@@ -647,6 +700,14 @@ TypeExprPtr Parser::parseType() {
       advance();
       t->package = t->name;
       t->name = advance().text;
+    }
+    if (t->package.empty() && t->name == "Vec" && at(TokenKind::LParen)) {
+      advance();
+      t->params.push_back(parseType());
+      expect(TokenKind::Comma, "after Vec element type");
+      t->lhs = parseExpr();
+      expect(TokenKind::RParen, "to close 'Vec(T, n)'");
+      return t;
     }
     if (t->package.empty() && t->name == "Quotient" && at(TokenKind::LParen)) {
       t->kind = TypeExprKind::Quotient;
@@ -857,24 +918,32 @@ ExprPtr Parser::parsePostfix() {
     } else if (at(TokenKind::LBracket)) {
       SourceLocation loc = peek().loc;
       advance();
-      bool braced = accept(TokenKind::LBrace);
-      EffectSet bits = 0;
-      if (!(braced ? at(TokenKind::RBrace) : at(TokenKind::RBracket))) {
-        do {
-          std::string name = expectIdentifier("as an instantiated effect");
-          EffectSet bit = 0;
-          if (!namedEffect(name, bit))
-            fail(peek(), "unknown effect '" + name + "' in instantiation");
-          bits = static_cast<EffectSet>(bits | bit);
-        } while (accept(TokenKind::Comma));
-      }
-      if (braced)
+      if (at(TokenKind::LBrace)) {
+        advance();
+        EffectSet bits = 0;
+        if (!at(TokenKind::RBrace)) {
+          do {
+            std::string name = expectIdentifier("as an instantiated effect");
+            EffectSet bit = 0;
+            if (!namedEffect(name, bit))
+              fail(peek(), "unknown effect '" + name + "' in instantiation");
+            bits = static_cast<EffectSet>(bits | bit);
+          } while (accept(TokenKind::Comma));
+        }
         expect(TokenKind::RBrace, "to close instantiated effect row");
-      expect(TokenKind::RBracket, "to close effect instantiation");
-      auto call = std::make_unique<CallExpr>(loc, std::move(e), parseArgs());
-      call->hasEffectInst = true;
-      call->effectInst = bits;
-      e = std::move(call);
+        expect(TokenKind::RBracket, "to close effect instantiation");
+        auto call = std::make_unique<CallExpr>(loc, std::move(e), parseArgs());
+        call->hasEffectInst = true;
+        call->effectInst = bits;
+        e = std::move(call);
+      } else {
+        TypeExprPtr arg = parseType();
+        expect(TokenKind::RBracket, "to close type instantiation");
+        auto call = std::make_unique<CallExpr>(loc, std::move(e), parseArgs());
+        call->hasTypeArg = true;
+        call->typeArg = std::move(arg);
+        e = std::move(call);
+      }
     } else if (at(TokenKind::KwAlong)) {
       if (!e || e->kind != ExprKind::Call)
         fail(peek(), "'along' follows a cofn self-call");

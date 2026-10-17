@@ -589,6 +589,90 @@ def main() -> int:
     ir_lacks(quot_ll, "Quotient", "quotient: no setoid in the IR")
     ok("quotient values lower as the canon of the carrier")
 
+    # ------------------------------------------------------------------
+    # 9. Universes, type binders, Text, structs, enums, Vec(T, n).
+    # ------------------------------------------------------------------
+    expect_ok([cruftc, "--check", str(CASES / "universe_ok.cruft")], "universe ok")
+    univ_ll = out / "universe_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(univ_ll), str(CASES / "universe_ok.cruft")],
+        "universe ir",
+    )
+    ir_lacks(univ_ll, "Type(", "universe: levels are erased")
+    ok("cumulative Type(n); bare Type is Type(0)")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "universe_bad.cruft")],
+        "Type(1)",
+        "universe cumulativity",
+    )
+    ok("Type(1) does not flow down to Type(0)")
+
+    link_and_run("type_binder_ok", CASES / "type_binder_ok.cruft", "4")
+    binder_ll = out / "type_binder_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(binder_ll), str(CASES / "type_binder_ok.cruft")],
+        "binder ir",
+    )
+    ir_lacks(binder_ll, "Type(", "binder: type argument is erased")
+    ok("fn id[T: Type(0)] instantiates at the call")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "type_binder_bad.cruft")],
+        "above the binder",
+        "binder level",
+    )
+    ok("a type argument cannot sit above its binder")
+
+    link_and_run("text_ok", CASES / "text_ok.cruft", "2")
+    text_ll = out / "text_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(text_ll), str(CASES / "text_ok.cruft")],
+        "text ir",
+    )
+    ir_has(text_ll, "type { ptr, i64 }", "text: fat pointer is ptr plus length")
+    ir_lacks(text_ll, "cruft.buf", "text: not the mutable string buffer")
+    ok("Text is an immutable {ptr, i64}")
+
+    link_and_run("struct_ok", CASES / "struct_ok.cruft", "3")
+    struct_ll = out / "struct_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(struct_ll), str(CASES / "struct_ok.cruft")],
+        "struct ir",
+    )
+    ir_has(struct_ll, "type { i32, i32 }", "struct: untagged product")
+    ok("struct is an untagged LLVM struct")
+
+    link_and_run("enum_ok", CASES / "enum_ok.cruft", "2")
+    ok("enum reuses inductive match")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "enum_bad.cruft")],
+        "cannot have a path constructor",
+        "enum path ctor",
+    )
+    ok("enum rejects path constructors")
+
+    link_and_run("vec_ok", CASES / "vec_ok.cruft", "5")
+    vec_ll = out / "vec_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(vec_ll), str(CASES / "vec_ok.cruft")],
+        "vec ir",
+    )
+    ir_lacks(vec_ll, "Vec(", "vec: length index is erased")
+    ir_has(vec_ll, "cruft.buf", "vec: runtime layout is the vector buffer")
+    ok("Vec(T, n) checks n and lowers as a vector")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "vec_bad.cruft")],
+        "Vec length",
+        "vec length mismatch",
+    )
+    ok("Vec(T, n) rejects the wrong number of elements")
+
+    link_and_run("sigma_ok", CASES / "sigma_ok.cruft", "2")
+    ok("a struct field may depend on an earlier field")
+
     print(f"\n{passed} tests passed")
     return 0
 

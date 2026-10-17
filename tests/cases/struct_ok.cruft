@@ -1,0 +1,12 @@
+package pairs
+
+struct Pair
+    x: i32
+    y: i32
+end
+
+pub fn main(): i32
+    var p = Pair(3, 4)
+    print(p.x)
+    ret 0
+end

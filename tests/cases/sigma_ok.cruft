@@ -1,0 +1,12 @@
+package sigma
+
+struct Buf
+    n: i32
+    xs: Vec(i32, n)
+end
+
+pub fn main(): i32
+    var b = Buf(2, [9, 8])
+    print(b.n)
+    ret 0
+end

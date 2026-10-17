@@ -1,0 +1,6 @@
+package univbad
+
+pub fn main(): i32
+    const bad: Type = Type
+    ret 0
+end
