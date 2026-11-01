@@ -1,0 +1,44 @@
+package fmt
+
+// `to_string` renders a scalar into an owned String. The bytes are produced
+// by the C runtime; the String is what the rest of the language sees.
+
+extern fn cruft_fmt_i64(buf: ptr, cap: i64, n: i64): i64
+extern fn cruft_fmt_u64(buf: ptr, cap: i64, n: u64): i64
+
+pub trait Display
+    fn to_string(self: Self): String ! {alloc}
+end
+
+pub impl Display for i64
+    fn to_string(self: i64): String ! {alloc}
+        var buf = alloc_string(32)
+        unsafe
+            var n = cruft_fmt_i64(buf.data(), 32, self)
+            buf.set_len(n)
+        end
+        ret buf
+    end
+end
+
+pub impl Display for usize
+    fn to_string(self: usize): String ! {alloc}
+        var wide: u64 = self as u64
+        var buf = alloc_string(32)
+        unsafe
+            var n = cruft_fmt_u64(buf.data(), 32, wide)
+            buf.set_len(n)
+        end
+        ret buf
+    end
+end
+
+pub impl Display for bool
+    fn to_string(self: bool): String ! {alloc}
+        if self then
+            ret "true"
+        else
+            ret "false"
+        end
+    end
+end

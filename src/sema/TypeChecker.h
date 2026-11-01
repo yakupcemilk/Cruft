@@ -10,8 +10,9 @@
 //   3. resolveSignatures   : types of functions, globals and constructors;
 //                            FFI layout checks for `extern`; no private type
 //                            may leak through a `pub` signature.
-//   4. checkGlobals        : initialisers are well-typed compile-time constants.
-//   5. checkFunctionBodies : statements and expressions, including the
+//   4. checkConstFunctions : `const fn` bodies, before any constant is folded.
+//   5. checkGlobals        : initialisers are well-typed compile-time constants.
+//   6. checkFunctionBodies : statements and expressions, including the
 //                            cubical rules (path boundaries, face systems,
 //                            path-respecting eliminators for HITs).
 #pragma once
@@ -38,6 +39,10 @@ public:
 
   ModuleRegistry &registry() { return registry_; }
   Normalizer &normalizer() { return normalizer_; }
+  TypePtr applyBinders(TypePtr type, const std::vector<const Symbol *> &binders,
+                       const std::vector<TypePtr> &args) const {
+    return instantiateBinders(type, binders, args);
+  }
 
 private:
   // ---- phases ----
@@ -47,10 +52,23 @@ private:
   void processExports();
   void checkDependencyGraph();
   void resolveSignatures();
-  void resolveFileSignatures(ast::File &file);
+  void resolveFileSignatures(ast::File &file, bool functions);
   void checkGlobals();
+  void checkConstFunctions();
   void checkFunctionBodies();
   void checkFunction(ast::FnDecl &fn);
+  void checkMain(const ast::FnDecl &fn);
+  void checkForIterator(ast::ForStmt &stmt);
+  void checkFieldAssign(ast::FieldAssignStmt &stmt);
+  void checkConstFn(const ast::FnDecl &fn);
+  void checkConstBlock(const ast::Block &block);
+  void checkConstExpr(const ast::Expr &e);
+  [[nodiscard]] bool isConstType(const Type &type, std::set<const Symbol *> &seen) const;
+  std::vector<const Symbol *> openTypeBinders(const std::vector<ast::FnDecl::TypeBinder> &binders);
+  TypePtr instantiateBinders(TypePtr type, const std::vector<const Symbol *> &binders,
+                             const std::vector<TypePtr> &args) const;
+  TypePtr instantiateSymbol(const Symbol &sym, const std::vector<TypePtr> &args, int region);
+  [[nodiscard]] TypePtr inferTypeArg(const Type &param, const TypePtr &arg, const Symbol *var) const;
 
   // ---- scopes ----
   /// `Arena` is the lexical contour opened by `scope arena`. Names declared
@@ -68,7 +86,7 @@ private:
     s.region = currentRegion_;
     scopes_.emplace_back(std::move(s));
   }
-  void popScope() { scopes_.pop_back(); }
+  void popScope();
   [[nodiscard]] bool insideArena() const;
   Symbol *declareLocal(Symbol sym);
   [[nodiscard]] Symbol *lookupLocal(const std::string &name) const;
@@ -117,6 +135,17 @@ private:
   TypePtr checkIdent(ast::ExprPtr &e, const Type *expected);
   TypePtr checkBinary(ast::BinaryExpr &e, const Type *expected);
   TypePtr checkUnary(ast::UnaryExpr &e, const Type *expected);
+  TypePtr checkCast(ast::CastExpr &e);
+  TypePtr checkBorrow(ast::BorrowExpr &e);
+  void releaseScopeBorrows();
+  void releaseStatementBorrows();
+  void acquireBorrow(const Symbol *owner, const Symbol *binding, bool mut,
+                     const SourceLocation &loc);
+  void bindLoan(const ast::Expr &init, const Symbol *binding);
+  void rejectIfBorrowed(const Symbol *owner, const SourceLocation &loc, bool mutating);
+  void requireUnsafe(const SourceLocation &loc, const std::string &what);
+  void noteSpawnShared(const ast::CallExpr &call);
+  TypePtr checkTry(ast::TryExpr &e);
   TypePtr checkCall(ast::ExprPtr &e, const Type *expected);
   TypePtr checkBuiltinCall(ast::CallExpr &call, ast::Builtin builtin, const Type *expected);
   TypePtr checkFnCall(ast::CallExpr &call, const Type &fnType, const Type *expected);
@@ -130,6 +159,43 @@ private:
   TypePtr checkArray(ast::ArrayLitExpr &e, const Type *expected);
   TypePtr checkLambda(ast::LambdaExpr &e, const Type *expected);
   TypePtr checkMethod(ast::ExprPtr &e, const Type *expected);
+  void assignFunctionType(ast::FnDecl &fn, const std::vector<const Symbol *> *sharedBinders);
+  void resolveTraits(ast::File &file);
+  void resolveImpls(ast::File &file);
+  struct TraitMethod {
+    std::string name;
+    TypePtr type;
+    SourceLocation loc;
+  };
+  struct ImplInfo {
+    const Symbol *trait = nullptr;
+    TypePtr target;
+    std::vector<const Symbol *> binders;
+    std::map<std::string, Symbol *> methods;
+    ast::Visibility visibility = ast::Visibility::Private;
+    std::string package;
+    SourceLocation loc;
+  };
+  struct TraitDispatch {
+    Symbol *fn = nullptr;
+    std::vector<TypePtr> typeArgs;
+  };
+  enum class TraitLookup { None, Found, Failed };
+  [[nodiscard]] bool typeMentions(const Type &type, const Symbol *var) const;
+  [[nodiscard]] bool traitTypesEqual(const Type &a, const Type &b);
+  [[nodiscard]] bool patternEqual(const Type &a, const Type &b,
+                                  const std::vector<const Symbol *> &bindersA,
+                                  const std::vector<const Symbol *> &bindersB);
+  [[nodiscard]] bool bindPattern(const Type &pattern, const TypePtr &actual,
+                                 const std::vector<const Symbol *> &binders,
+                                 std::vector<TypePtr> &args);
+  [[nodiscard]] bool matchImpl(const ImplInfo &impl, const TypePtr &recv,
+                               std::vector<TypePtr> &args);
+  [[nodiscard]] bool sameImplTarget(const ImplInfo &a, const ImplInfo &b);
+  TraitLookup lookupTrait(const std::string &name, const TypePtr &recv, const SourceLocation &loc,
+                          TraitDispatch &out);
+  TypePtr tryTraitMethod(ast::ExprPtr &e, const TypePtr &recv, const Type *expected);
+  bool tryTraitFunction(ast::CallExpr &call, const Type *expected, TypePtr &out);
   TypePtr checkStructCall(ast::CallExpr &call, const Type &structType);
   TypePtr substTypeVar(const TypePtr &type, const Symbol *var, const TypePtr &replacement) const;
   [[nodiscard]] int universeOf(const Type &type) const;
@@ -179,6 +245,22 @@ private:
   std::set<const Symbol *> moved_;
   bool consume_ = true; ///< false while checking a borrowed method receiver
   std::vector<EffectRow> effectStack_;
+  int loopDepth_ = 0;
+  struct LiveBorrow {
+    const Symbol *owner = nullptr;
+    const Symbol *refBinding = nullptr; ///< null until a `var` binds the loan
+    bool mut = false;
+    int scopeDepth = 0;
+  };
+  std::vector<LiveBorrow> borrows_;
+  int unsafeDepth_ = 0;
+  bool inBorrowPlace_ = false; ///< the place of `&` / `&mut` is not a use of the owner
+  TypePtr currentSelf_; ///< impl target while resolving an impl method signature
+  int implSerial_ = 0;
+  std::map<const Symbol *, std::vector<TraitMethod>> traitMethods_;
+  std::map<const Symbol *, const Symbol *> traitSelf_;
+  std::map<const Symbol *, std::vector<const Symbol *>> traitBinders_;
+  std::vector<ImplInfo> impls_;
 };
 
 } // namespace cruft::sema

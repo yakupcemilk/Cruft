@@ -23,8 +23,16 @@ struct Type;
 using TypePtr = std::shared_ptr<const Type>;
 
 enum class TypeKind {
+  I8,
+  I16,
   I32,
   I64,
+  U8,
+  U16,
+  U32,
+  U64,
+  USize, ///< unsigned integer the width of a pointer
+  ISize, ///< signed integer the width of a pointer
   F32,
   F64,
   Bool,
@@ -46,6 +54,8 @@ enum class TypeKind {
   Text,      ///< immutable {ptr, len}; copyable, no capacity
   Struct,    ///< untagged product; later fields may mention earlier ones
   TyVar,     ///< type binder T in fn id[T: Type(k)]
+  Ref,       ///< &T or &mut T; payload is `elem`, `refMut` selects exclusive
+  Simd,      ///< Simd(T, n) — LLVM vector of n lanes; `elem` is the lane, `lanes` is n
   Error      ///< poisoned type after a diagnostic
 };
 
@@ -68,6 +78,10 @@ struct Type {
   ast::EffectSet effects = 0;
   std::string effectVar;
   bool effectsDeclared = false;
+  /// `extern fn` trailing `...`. Defined functions cannot set this.
+  bool varArg = false;
+  /// `&mut T` when true, shared `&T` otherwise.
+  bool refMut = false;
 
   /// Labeled payload label, or the source label of a Leak.
   ast::Secrecy secrecy = ast::Secrecy::Public;
@@ -80,9 +94,16 @@ struct Type {
   int level = 0;
   /// Length index of `Vec(T, n)`. Null for a dynamic `Vector(T)`. Erased in LLVM.
   ast::ExprPtr vecLen;
+  /// Lane count of `Simd(T, n)`. Zero for every other type.
+  int lanes = 0;
   /// Binder of a generic function. `-1` means the function is not generic.
+  /// `typeParams` is the full list; `typeParam` is the first, if any.
   const Symbol *typeParam = nullptr;
   int typeParamLevel = -1;
+  std::vector<const Symbol *> typeParams;
+  std::vector<int> typeParamLevels;
+  /// Concrete arguments of a specialised struct or inductive. Empty when generic.
+  std::vector<TypePtr> typeArgs;
   /// TyVar: the binder this type stands for.
   const Symbol *tyVar = nullptr;
 
@@ -96,8 +117,16 @@ struct Type {
 
   // --- factories -------------------------------------------------------
   static TypePtr primitive(TypeKind k);
+  static TypePtr i8();
+  static TypePtr i16();
   static TypePtr i32();
   static TypePtr i64();
+  static TypePtr u8();
+  static TypePtr u16();
+  static TypePtr u32();
+  static TypePtr u64();
+  static TypePtr usize();
+  static TypePtr isize();
   static TypePtr f32();
   static TypePtr f64();
   static TypePtr boolean();
@@ -112,7 +141,10 @@ struct Type {
                     TypePtr ret, std::vector<ast::Usage> paramUse = {},
                     ast::EffectSet effects = 0, std::string effectVar = {},
                     bool effectsDeclared = false, const Symbol *typeParam = nullptr,
-                    int typeParamLevel = -1);
+                    int typeParamLevel = -1, bool varArg = false,
+                    std::vector<const Symbol *> typeParams = {},
+                    std::vector<int> typeParamLevels = {});
+  static TypePtr refTy(TypePtr elem, bool mut, int region);
   static TypePtr labeled(TypePtr elem, ast::Secrecy secrecy);
   static TypePtr leak(ast::Secrecy from, ast::Secrecy to);
   static TypePtr quotient(TypePtr carrier, ast::ExprPtr rel, ast::ExprPtr canon,
@@ -127,9 +159,28 @@ struct Type {
   static TypePtr stringTy(int region);
   static TypePtr slice(TypePtr elem, int region);
   static TypePtr ptr();
+  static TypePtr simd(TypePtr elem, int lanes);
 
   // --- queries ---------------------------------------------------------
-  [[nodiscard]] bool isInteger() const { return kind == TypeKind::I32 || kind == TypeKind::I64; }
+  [[nodiscard]] bool isInteger() const {
+    return kind == TypeKind::I8 || kind == TypeKind::I16 || kind == TypeKind::I32 ||
+           kind == TypeKind::I64 || kind == TypeKind::U8 || kind == TypeKind::U16 ||
+           kind == TypeKind::U32 || kind == TypeKind::U64 || kind == TypeKind::USize ||
+           kind == TypeKind::ISize;
+  }
+  [[nodiscard]] bool isSignedInteger() const {
+    return kind == TypeKind::I8 || kind == TypeKind::I16 || kind == TypeKind::I32 ||
+           kind == TypeKind::I64 || kind == TypeKind::ISize;
+  }
+  [[nodiscard]] bool isUnsignedInteger() const {
+    return kind == TypeKind::U8 || kind == TypeKind::U16 || kind == TypeKind::U32 ||
+           kind == TypeKind::U64 || kind == TypeKind::USize;
+  }
+  /// Width of `usize` and `isize` for this compilation. The driver sets it
+  /// from the target triple before type checking.
+  static void setPointerBits(unsigned bits);
+  [[nodiscard]] static unsigned pointerBits();
+  [[nodiscard]] unsigned bitWidth() const;
   [[nodiscard]] bool isFloat() const { return kind == TypeKind::F32 || kind == TypeKind::F64; }
   [[nodiscard]] bool isNumeric() const { return isInteger() || isFloat(); }
   [[nodiscard]] bool isError() const { return kind == TypeKind::Error; }
@@ -161,6 +212,8 @@ struct Type {
       return elem->isRegionBound();
     if (kind == TypeKind::Quotient && elem)
       return elem->isRegionBound();
+    if (kind == TypeKind::Ref)
+      return true;
     return isStorage() || kind == TypeKind::Slice;
   }
 
@@ -177,7 +230,8 @@ enum class SymbolKind {
   IntervalVar, ///< binder introduced by `<i>` or `foreach i in I`
   PatternVar,  ///< binder introduced by a `case` pattern
   Axiom,       ///< erased `axiom` inhabiting `Leak`
-  TypeParam    ///< erased type binder `T` in `fn id[T: Type(k)]`
+  TypeParam,   ///< erased type binder `T` in `fn id[T: Type(k)]`
+  Trait        ///< `trait` declaration; methods live beside it, not as values
 };
 
 struct Symbol {
@@ -199,6 +253,11 @@ struct Symbol {
   const ast::TypeDecl *typeDecl = nullptr;
   const ast::CtorDecl *ctorDecl = nullptr;
   const ast::Expr *constInit = nullptr; ///< initializer of a `const` (for unfolding)
+
+  /// Type binders of a generic function, struct, or inductive.
+  std::vector<const Symbol *> typeBinders;
+  /// User `drop` for this struct, if one was declared.
+  const ast::FnDecl *dropFn = nullptr;
 
   // Ctor-specific
   const Symbol *owner = nullptr; ///< the inductive type symbol

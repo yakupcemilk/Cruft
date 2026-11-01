@@ -1,0 +1,24 @@
+package atomic
+
+// Memory orders for cmpxchg, atomicrmw, atomic_load and atomic_store.
+// The constructor name is the order. A variable of this type is not an order:
+// the operation has to see the constructor itself.
+
+pub enum Order
+    Relaxed
+    Acquire
+    Release
+    AcqRel
+    SeqCst
+end
+
+// The operation performed by atomicrmw. The result is the previous value.
+
+pub enum Rmw
+    Xchg
+    Add
+    Sub
+    And
+    Or
+    Xor
+end

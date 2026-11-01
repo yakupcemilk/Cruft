@@ -11,10 +11,12 @@ Exercises:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +26,8 @@ ARENA_C = ROOT.parent / "src" / "runtime" / "arena.c"
 MEM_C = ROOT.parent / "src" / "runtime" / "mem.c"
 FS_C = ROOT.parent / "src" / "runtime" / "fs.c"
 IO_C = ROOT.parent / "src" / "runtime" / "io.c"
+FMT_C = ROOT.parent / "src" / "runtime" / "fmt.c"
+THREAD_C = ROOT.parent / "src" / "runtime" / "thread.c"
 
 
 class Fail(Exception):
@@ -598,7 +602,8 @@ def main() -> int:
         [cruftc, "-emit-llvm", "-o", str(univ_ll), str(CASES / "universe_ok.cruft")],
         "universe ir",
     )
-    ir_lacks(univ_ll, "Type(", "universe: levels are erased")
+    ir_lacks(univ_ll, "Type(0)", "universe: levels are erased")
+    ir_lacks(univ_ll, "Type(1)", "universe: levels are erased")
     ok("cumulative Type(n); bare Type is Type(0)")
 
     expect_fail(
@@ -614,7 +619,7 @@ def main() -> int:
         [cruftc, "-emit-llvm", "-o", str(binder_ll), str(CASES / "type_binder_ok.cruft")],
         "binder ir",
     )
-    ir_lacks(binder_ll, "Type(", "binder: type argument is erased")
+    ir_lacks(binder_ll, "Type(0)", "binder: type argument is erased")
     ok("fn id[T: Type(0)] instantiates at the call")
 
     expect_fail(
@@ -672,6 +677,409 @@ def main() -> int:
 
     link_and_run("sigma_ok", CASES / "sigma_ok.cruft", "2")
     ok("a struct field may depend on an earlier field")
+
+    # ------------------------------------------------------------------
+    # 10. Phases 0-5: widths, loops, hash maps, generics, borrows, Result.
+    # ------------------------------------------------------------------
+    link_and_run("phase_int", CASES / "phase_int.cruft", "8", "16", "true", "3")
+    int_ll = out / "phase_int.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(int_ll), str(CASES / "phase_int.cruft")],
+        "phase int ir",
+    )
+    ir_has(int_ll, "...", "varargs: extern fn keeps a C vararg prototype")
+    ir_has(int_ll, "!dbg", "debug: line locations are attached")
+    ir_lacks(int_ll, "Path(", "new features do not leak Path into the IR")
+    ok("integer widths, casts, shifts, extern varargs, and line tables")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_bad_cast.cruft")],
+        "cannot cast",
+        "bad cast",
+    )
+    ok("as rejects a string-to-integer cast")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_bad_shift.cruft")],
+        "requires integer operands",
+        "shift of bool",
+    )
+    ok("a shift requires integers")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_varargs_bad.cruft")],
+        "only allowed on an 'extern fn'",
+        "defined varargs",
+    )
+    ok("a defined function cannot be varargs")
+
+    link_and_run("phase_loop", CASES / "phase_loop.cruft", "3", "2", "9", "4")
+    ok("for, break, push, and index assignment")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_break_bad.cruft")],
+        "outside a 'while' or 'for'",
+        "break outside",
+    )
+    ok("break outside a loop is an error")
+
+    link_and_run("phase_map", CASES / "phase_map.cruft", "2", "true", "11", "false", "1")
+    ok("hash map insert replaces, get returns Option, remove tombstones")
+
+    link_and_run("phase_generic", CASES / "phase_generic.cruft", "4", "3")
+    gen_ll = out / "phase_generic.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(gen_ll), str(CASES / "phase_generic.cruft")],
+        "generic ir",
+    )
+    ir_has(gen_ll, "i32", "generic: specialisation names the argument types")
+    ir_has(gen_ll, "Pair", "generic: struct specialisation is cached by arguments")
+    ok("multi-binder functions and generic structs monomorphise")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_generic_bad.cruft")],
+        "type argument",
+        "generic arity",
+    )
+    ok("a generic call must pass every binder")
+
+    link_and_run("phase_borrow", CASES / "phase_borrow.cruft", "1", "7")
+    ok("&mut auto-borrows into a mutating method")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_borrow_bad.cruft")],
+        "does not live long enough",
+        "arena borrow",
+    )
+    ok("a borrow cannot escape an arena")
+
+    link_and_run("phase_a_ok", CASES / "phase_a_ok.cruft", "3", "10", "20", "6", "30")
+    ok("exclusive borrows, unsafe ptr use, and a vector slice")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_a_borrow_bad.cruft")],
+        "overlapping mutable borrow",
+        "two &mut",
+    )
+    ok("two active &mut borrows of one variable are rejected")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_a_unsafe_bad.cruft")],
+        "requires 'unsafe'",
+        "ptr outside unsafe",
+    )
+    ok("ptr.addr outside unsafe is rejected")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_a_slice_bad.cruft")],
+        "cannot mutate",
+        "mutate while sliced",
+    )
+    ok("a vector cannot be reallocated while a slice borrows it")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_a_slice_escape.cruft")],
+        "borrows",
+        "return slice of local",
+    )
+    ok("a slice of a local vector cannot be returned")
+
+    link_and_run("phase_b_ok", CASES / "phase_b_ok.cruft", "2", "1", "3")
+    ok("static trait dispatch for a struct, a generic impl, Vector and Slice")
+
+    phase_b_ll = out / "phase_b_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(phase_b_ll), str(CASES / "phase_b_ok.cruft")],
+        "phase b ir",
+    )
+    ir_has(phase_b_ll, "len/i32", "monomorphised Wrap(i32) witness")
+    ir_has(phase_b_ll, "len/i64", "monomorphised Wrap(i64) witness")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_b_missing.cruft")],
+        "missing method",
+        "incomplete impl",
+    )
+    ok("an impl must supply every trait method")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_b_sig.cruft")],
+        "does not match",
+        "impl signature",
+    )
+    ok("an impl method must match the trait signature")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_b_none.cruft")],
+        "no implementation of method",
+        "missing impl",
+    )
+    ok("a method with no impl is rejected")
+
+    win = "x86_64-pc-windows-gnu"
+    linux = "x86_64-unknown-linux-gnu"
+    phase_c_obj = out / "phase_c_ok.o"
+    phase_c_exe = out / ("phase_c_ok.exe" if os.name == "nt" else "phase_c_ok")
+    expect_ok(
+        [cruftc, "-c", "--target", win, "-o", str(phase_c_obj), str(CASES / "phase_c_ok.cruft")],
+        "phase c object",
+    )
+    expect_ok(
+        [cc, str(phase_c_obj), str(ARENA_C), str(MEM_C), "-o", str(phase_c_exe)],
+        "link phase c",
+    )
+    phase_c_run = expect_ok([str(phase_c_exe)], "run phase c")
+    phase_c_lines = [ln.strip() for ln in (phase_c_run.stdout or "").splitlines() if ln.strip()]
+    if phase_c_lines != ["36", "3", "16", "10", "7"]:
+        raise Fail(f"phase c: expected 36, 3, 16, 10, 7, got {phase_c_lines!r}")
+    ok("const fn folds scalars and structs; cfg keeps the windows arm")
+
+    phase_c_ll = out / "phase_c_ok.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "--target", win, "-o", str(phase_c_ll), str(CASES / "phase_c_ok.cruft")],
+        "phase c ir",
+    )
+    ir_has(phase_c_ll, "i32 36", "square(6) lowered to 36")
+    ir_lacks(phase_c_ll, "call i32 @demo__square", "folded const fn is not a call")
+
+    expect_fail(
+        [cruftc, "--check", "--target", linux, str(CASES / "phase_c_ok.cruft")],
+        "type mismatch",
+        "linux cfg arm",
+    )
+    ok("cfg drops every arm that does not match the target triple")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_c_bad.cruft")],
+        "const fn can only call a const fn",
+        "non-const call from const fn",
+    )
+    ok("a const fn cannot call an ordinary function")
+
+    phase_d_obj = out / "phase_d_ok.o"
+    phase_d_exe = out / ("phase_d_ok.exe" if os.name == "nt" else "phase_d_ok")
+    expect_ok(
+        [cruftc, "-c", "-o", str(phase_d_obj), str(CASES / "phase_d_ok.cruft")],
+        "phase d object",
+    )
+    expect_ok(
+        [cc, str(phase_d_obj), str(MEM_C), str(FS_C), str(IO_C), str(FMT_C), "-o", str(phase_d_exe)],
+        "link phase d",
+    )
+    phase_d_run = expect_ok([str(phase_d_exe)], "run phase d")
+    phase_d_lines = [ln.strip() for ln in (phase_d_run.stdout or "").splitlines() if ln.strip()]
+    if phase_d_lines != ["6", "36", "true", "8", "-3", "1", "hello"]:
+        raise Fail(f"phase d: expected iterator, format, usize, argc and File, got {phase_d_lines!r}")
+    ok("iterators, formatting, usize, main arguments and File drop")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_d_bad.cruft")],
+        "main must be",
+        "main signature",
+    )
+    ok("main is fn main(): i32 or fn main(argc: i32, argv: ptr): i32")
+
+    phase_e_obj = out / "phase_e_ok.o"
+    phase_e_exe = out / ("phase_e_ok.exe" if os.name == "nt" else "phase_e_ok")
+    phase_e_ll = out / "phase_e_ok.ll"
+    expect_ok(
+        [cruftc, "-c", "-o", str(phase_e_obj), str(CASES / "phase_e_ok.cruft")],
+        "phase e object",
+    )
+    expect_ok(
+        [cc, str(phase_e_obj), str(MEM_C), str(THREAD_C), "-pthread", "-o", str(phase_e_exe)],
+        "link phase e",
+    )
+    phase_e_run = expect_ok([str(phase_e_exe)], "run phase e")
+    phase_e_lines = [ln.strip() for ln in (phase_e_run.stdout or "").splitlines() if ln.strip()]
+    if phase_e_lines != ["41", "11", "3", "7", "10"]:
+        raise Fail(f"phase e: expected cmpxchg, simd, refcount, join and atomic add, got {phase_e_lines!r}")
+    expect_ok(
+        [cruftc, "-emit-llvm", "-o", str(phase_e_ll), str(CASES / "phase_e_ok.cruft")],
+        "phase e ir",
+    )
+    ir_has(phase_e_ll, "cmpxchg", "cmpxchg lowers to a cmpxchg")
+    ir_has(phase_e_ll, "atomicrmw", "refcount and atomicrmw are atomic")
+    ir_has(phase_e_ll, "<4 x i32>", "Simd lowers to an LLVM vector")
+    ir_has(phase_e_ll, 'asm sideeffect "nop"', "asm lowers to inline assembly")
+    ok("atomics, atomic refcount, threads, simd and inline asm")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_e_bad.cruft")],
+        "spawn requires a shared value",
+        "spawn of a non-shared value",
+    )
+    ok("spawn requires a shared value")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_e_unsafe.cruft")],
+        "requires 'unsafe'",
+        "cmpxchg outside unsafe",
+    )
+    ok("cmpxchg outside unsafe is rejected")
+
+    link_and_run("phase_try", CASES / "phase_try.cruft", "4", "7")
+    ok("postfix ? returns the Result error")
+
+    expect_fail(
+        [cruftc, "--check", str(CASES / "phase_try_bad.cruft")],
+        "error type",
+        "try error mismatch",
+    )
+    ok("? requires the same error type")
+
+    drop_obj = out / "phase_drop.o"
+    drop_c = out / "drop_note.o"
+    drop_exe = out / ("phase_drop.exe" if os.name == "nt" else "phase_drop")
+    expect_ok([cruftc, "-c", "-o", str(drop_obj), str(CASES / "phase_drop.cruft")], "drop object")
+    expect_ok([cc, "-c", str(ROOT / "ffi" / "drop_note.c"), "-o", str(drop_c)], "compile drop_note.c")
+    expect_ok(
+        [cc, str(drop_obj), str(drop_c), str(ARENA_C), str(MEM_C), "-o", str(drop_exe)],
+        "link drop",
+    )
+    drop_run = expect_ok([str(drop_exe)], "run drop")
+    if "1" not in (drop_run.stdout or ""):
+        raise Fail(f"drop: expected the counter to print 1, got {drop_run.stdout!r}")
+    ok("user drop runs when the struct goes out of scope")
+
+    # ------------------------------------------------------------------
+    # Phase F. Debug info, sanitizers, the lockfile, the formatter, LSP.
+    # ------------------------------------------------------------------
+    phase_f_ll = out / "phase_f.ll"
+    expect_ok(
+        [cruftc, "-emit-llvm", "--sanitize", "address", "-o", str(phase_f_ll), str(CASES / "phase_f_dbg.cruft")],
+        "phase f ir",
+    )
+    ir_has(phase_f_ll, "!DILocalVariable(name: \"n\"", "variable n has a debug location")
+    ir_has(phase_f_ll, "!DISubroutineType", "functions have subroutine types")
+    ir_has(phase_f_ll, "!DIBasicType", "subroutine types name scalars")
+    ir_has(phase_f_ll, "sanitize_address", "address sanitizer reaches LLVM")
+    ok("dwarf locals, subroutine types, and sanitize_address")
+
+    expect_fail(
+        [cruftc, "--sanitize", "nope", str(CASES / "phase_f_dbg.cruft")],
+        "unknown sanitizer",
+        "unknown sanitizer",
+    )
+    ok("unknown sanitizer is rejected")
+
+    lock_root = out / "lockproj"
+    if lock_root.exists():
+        shutil.rmtree(lock_root)
+    util_dir = lock_root / "util"
+    util_dir.mkdir(parents=True)
+    util_src = "package util\n\npub fn value(): i32\n    ret 3\nend\n"
+    (util_dir / "util.cruft").write_text(util_src, encoding="utf-8")
+    (lock_root / "cruft.toml").write_text(
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nutil = \"util/util.cruft\"\n",
+        encoding="utf-8",
+    )
+    (lock_root / "main.cruft").write_text(
+        "package app\n\nimport util\n\npub fn main(): i32\n    ret util.value()\nend\n",
+        encoding="utf-8",
+    )
+    expect_ok(
+        [cruftc, "--lock", "--check", str(lock_root / "main.cruft")],
+        "write cruft.lock",
+    )
+    lock_text = (lock_root / "cruft.lock").read_text(encoding="utf-8")
+    if "util/util.cruft#" not in lock_text or len(lock_text) < 80:
+        raise Fail(f"lockfile did not pin util: {lock_text!r}")
+    expect_ok([cruftc, "--check", str(lock_root / "main.cruft")], "locked compile")
+    (util_dir / "util.cruft").write_text(util_src + "\n", encoding="utf-8")
+    expect_fail(
+        [cruftc, "--check", str(lock_root / "main.cruft")],
+        "lockfile",
+        "stale lockfile",
+    )
+    ok("dependency lockfile pins the path and digest")
+
+    golden = (
+        "fn main(): i32\n"
+        "    var n: i32 = 1\n"
+        "    if n < 2 then\n"
+        "        ret n\n"
+        "    end\n"
+        "    ret 0\n"
+        "end\n"
+    )
+    messy = "fn main(): i32\nvar n: i32 = 1\n  if n < 2 then\nret n\n end\n ret 0\nend\n"
+    fmt_path = out / "phase_f_fmt.cruft"
+    fmt_path.write_bytes(messy.encode("utf-8"))
+    formatted = expect_ok([cruftc, "--fmt", str(fmt_path)], "format").stdout
+    if formatted != golden:
+        raise Fail(f"formatter:\n{formatted!r}\nexpected:\n{golden!r}")
+    fmt_path.write_bytes(golden.encode("utf-8"))
+    expect_ok([cruftc, "--fmt-check", str(fmt_path)], "format check")
+    again = expect_ok([cruftc, "--fmt", str(fmt_path)], "format again").stdout
+    if again != golden:
+        raise Fail("formatter is not idempotent")
+    ok("formatter indents end-terminated blocks")
+
+    def lsp_write(proc, payload):
+        data = json.dumps(payload).encode("utf-8")
+        proc.stdin.write(f"Content-Length: {len(data)}\r\n\r\n".encode("ascii") + data)
+        proc.stdin.flush()
+
+    def lsp_read(stream):
+        headers = {}
+        while True:
+            line = stream.readline()
+            if not line:
+                return None
+            if line in (b"\r\n", b"\n"):
+                break
+            text = line.decode("ascii", errors="replace")
+            key, _, value = text.partition(":")
+            headers[key.strip().lower()] = value.strip()
+        body = stream.read(int(headers.get("content-length", "0")))
+        return json.loads(body.decode("utf-8"))
+
+    lsp = subprocess.Popen(
+        [sys.executable, str(ROOT.parent / "tools" / "cruftlsp.py"),
+         "--cruftc", cruftc, "--lib", str(ROOT.parent / "std")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    box = {}
+
+    def lsp_collect():
+        box["init"] = lsp_read(lsp.stdout)
+        box["diag"] = lsp_read(lsp.stdout)
+
+    collector = threading.Thread(target=lsp_collect, daemon=True)
+    collector.start()
+    try:
+        lsp_write(lsp, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        lsp_write(
+            lsp,
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///phase_f.cruft",
+                        "languageId": "cruft",
+                        "version": 1,
+                        "text": (CASES / "phase_e_unsafe.cruft").read_text(encoding="utf-8"),
+                    }
+                },
+            },
+        )
+        collector.join(20)
+        if "diag" not in box or box["diag"] is None:
+            raise Fail(f"language server produced no diagnostic\nstderr:\n{lsp.stderr.read()!r}")
+        diag = json.dumps(box["diag"])
+        if "publishDiagnostics" not in diag or "requires 'unsafe'" not in diag:
+            raise Fail(f"language server diagnostic: {diag}")
+        lsp_write(lsp, {"jsonrpc": "2.0", "id": 2, "method": "shutdown"})
+        lsp_write(lsp, {"jsonrpc": "2.0", "method": "exit"})
+        lsp.wait(timeout=10)
+    finally:
+        if lsp.poll() is None:
+            lsp.kill()
+    ok("language server reports cruftc diagnostics")
 
     print(f"\n{passed} tests passed")
     return 0

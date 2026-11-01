@@ -1,0 +1,44 @@
+package demo
+
+import vector
+import slice
+
+struct Pair
+    a: i32
+    b: i32
+end
+
+trait Length
+    fn len(self: &Self): i64
+end
+
+impl Length for Pair
+    fn len(self: &Pair): i64
+        ret 2
+    end
+end
+
+struct Wrap[T: Type(0)]
+    value: T
+end
+
+impl Length[T: Type(0)] for Wrap(T)
+    fn len(self: &Wrap(T)): i64
+        ret 1
+    end
+end
+
+pub fn main(): i32
+    var p = Pair(4, 5)
+    print(p.len())
+    print(len(&p))
+    var wi: Wrap(i32) = Wrap(7)
+    var wl: Wrap(i64) = Wrap(8)
+    print(wi.len())
+    print(wl.len())
+    var xs: Vector(i32) = [1, 2, 3]
+    print(xs.len())
+    var view = xs.slice()
+    print(view.len())
+    ret 0
+end

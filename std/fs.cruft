@@ -1,5 +1,7 @@
 package fs
 
+import result
+
 // Filesystem module. The loader finds this file as std/fs.cruft when a
 // program `import fs`. Package names are a single identifier, same as `mem`.
 //
@@ -8,6 +10,9 @@ package fs
 // file past 2 GiB. `ptr` is an untyped C pointer; `null()` is the null pointer.
 // String literals and `alloc_string` are NUL-terminated, so `.data()` is a
 // C string for as long as the String value is alive.
+//
+// `File` owns the FILE*. Its `drop` calls `cruft_fclose`. `write_file` and
+// `read_to_string` do not close the handle themselves.
 
 extern fn cruft_fopen(path: ptr, mode: ptr): ptr
 extern fn cruft_fread(buf: ptr, size: i64, count: i64, stream: ptr): i64
@@ -17,53 +22,69 @@ extern fn cruft_ftell(stream: ptr): i64
 extern fn cruft_fclose(stream: ptr): i32
 extern fn cruft_exists(path: ptr): i32
 
+pub struct File
+    handle: ptr
+end
+
+drop File(self: &File)
+    unsafe
+        if self.handle != null() then
+            var rc: i32 = cruft_fclose(self.handle)
+        end
+    end
+end
+
 pub fn exists(path: str): bool ! {io}
-    ret cruft_exists(path.data()) != 0
+    unsafe
+        ret cruft_exists(path.data()) != 0
+    end
 end
 
-pub fn write_file(path: str, content: str): bool ! {io}
-    var file: ptr = cruft_fopen(path.data(), "wb".data())
-    if file == null() then
-        ret false
+pub fn open(path: str, mode: str): result.Result(File, i32) ! {io}
+    unsafe
+        var h: ptr = cruft_fopen(path.data(), mode.data())
+        if h == null() then
+            ret result.Err(1)
+        end
+        ret result.Ok(File(h))
     end
-    var n: i64 = content.byte_len()
-    var got: i64 = cruft_fwrite(content.data(), 1, n, file)
-    var closed: i32 = cruft_fclose(file)
-    if closed != 0 then
-        ret false
-    end
-    ret got == n
 end
 
-pub fn read_to_string(path: str): String ! {io, alloc}
-    var file: ptr = cruft_fopen(path.data(), "rb".data())
-    if file == null() then
-        ret ""
+pub fn write_file(path: str, content: str): result.Result(i32, i32) ! {io}
+    var file = open(path, "wb")?
+    unsafe
+        var n: i64 = content.byte_len()
+        var got: i64 = cruft_fwrite(content.data(), 1, n, file.handle)
+        if got != n then
+            ret result.Err(3)
+        end
     end
-    var end_rc: i32 = cruft_fseek(file, 0, 2)
-    if end_rc != 0 then
-        var closed: i32 = cruft_fclose(file)
-        ret ""
+    ret result.Ok(0)
+end
+
+pub fn read_to_string(path: str): result.Result(String, i32) ! {io, alloc}
+    var file = open(path, "rb")?
+    unsafe
+        var end_rc: i32 = cruft_fseek(file.handle, 0, 2)
+        if end_rc != 0 then
+            ret result.Err(2)
+        end
+        var n: i64 = cruft_ftell(file.handle)
+        if n < 0 then
+            ret result.Err(2)
+        end
+        var set_rc: i32 = cruft_fseek(file.handle, 0, 0)
+        if set_rc != 0 then
+            ret result.Err(2)
+        end
+        var buf: String = alloc_string(n)
+        if n > 0 and buf.data() == null() then
+            ret result.Err(4)
+        end
+        var got: i64 = cruft_fread(buf.data(), 1, n, file.handle)
+        if got != n then
+            ret result.Err(3)
+        end
+        ret result.Ok(buf)
     end
-    var n: i64 = cruft_ftell(file)
-    if n < 0 then
-        var closed: i32 = cruft_fclose(file)
-        ret ""
-    end
-    var set_rc: i32 = cruft_fseek(file, 0, 0)
-    if set_rc != 0 then
-        var closed: i32 = cruft_fclose(file)
-        ret ""
-    end
-    var buf: String = alloc_string(n)
-    if n > 0 and buf.data() == null() then
-        var closed: i32 = cruft_fclose(file)
-        ret ""
-    end
-    var got: i64 = cruft_fread(buf.data(), 1, n, file)
-    var closed: i32 = cruft_fclose(file)
-    if got != n then
-        ret ""
-    end
-    ret buf
 end

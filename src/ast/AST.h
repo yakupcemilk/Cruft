@@ -86,7 +86,8 @@ enum class TypeExprKind {
   Path,     ///< Path(T, a, b)
   Equiv,    ///< Equiv(A, B)
   Fn,       ///< fn(A, B): R
-  Quotient  ///< Quotient(T, rel, canon)
+  Quotient, ///< Quotient(T, rel, canon)
+  Ref       ///< &T or &mut T (`refMut` on the node; element in `elem`)
 };
 
 struct TypeExpr {
@@ -111,6 +112,8 @@ struct TypeExpr {
   bool effectsDeclared = false;
   /// `Type(n)`. Bare `Type` is level 0.
   int level = 0;
+  /// `&mut` when `kind == Ref`.
+  bool refMut = false;
 
   explicit TypeExpr(TypeExprKind k, SourceLocation l) : kind(k), loc(std::move(l)) {}
   [[nodiscard]] TypeExprPtr clone() const;
@@ -137,13 +140,18 @@ enum class ExprKind {
   StringLit,   ///< "..."
   ArrayLit,    ///< [e, e, ...]
   Lambda,      ///< fn(x) => e
-  Method       ///< receiver.name(args)  — also package.name before resolution
+  Method,      ///< receiver.name(args)  — also package.name before resolution
+  Cast,        ///< e as T
+  Borrow,      ///< &e or &mut e
+  Try          ///< e?   early return of Err / None
 };
 
 enum class BinaryOp {
   Add, Sub, Mul, Div, Rem,
   Eq, Ne, Lt, Le, Gt, Ge,
   And, Or,
+  BitAnd, BitOr, BitXor,
+  Shl, Shr,
   Meet, ///< /\ on the interval
   Join  ///< \/ on the interval
 };
@@ -168,7 +176,17 @@ enum class Builtin {
   Seal,        ///< seal(x) : Secret(T)
   Reveal,      ///< reveal(s, p) : T   where p : Leak(label(s), Public)
   Quot,        ///< quot(x, p) : Quotient(T, rel, canon)
-  Text         ///< text("...") : Text
+  Text,        ///< text("...") : Text
+  Assert,      ///< assert(cond)
+  Trap,        ///< trap("...")
+  CmpXchg,     ///< cmpxchg(&slot, expected, desired, success, failure): bool
+  AtomicRmw,   ///< atomicrmw(Rmw.Add, &slot, value, Order.Relaxed): T
+  AtomicLoad,  ///< atomic_load(&slot, Order.Acquire): T
+  AtomicStore, ///< atomic_store(&slot, value, Order.Release)
+  Simd,        ///< simd(a, b, ...): Simd(T, n)   expected type supplies T and n
+  SimdAdd,     ///< simd_add(a, b): Simd(T, n)
+  SimdExtract, ///< simd_extract(v, index): T
+  Asm          ///< asm("nop")  inline assembly, side effecting
 };
 
 /// How a `transport` call computes once its type path has been normalised.
@@ -180,6 +198,8 @@ struct Expr {
   TypeRef type; ///< filled in by the TypeChecker
   /// Set when this value is an affine or linear resource. Copyable data stays `Many`.
   Usage flow = Usage::Many;
+  /// Vector or string this slice or reference is a view of. Not part of the type.
+  const sema::Symbol *loanOwner = nullptr;
 
   Expr(ExprKind k, SourceLocation l) : kind(k), loc(std::move(l)) {}
   virtual ~Expr() = default;
@@ -243,9 +263,11 @@ struct CallExpr final : Expr {
   bool tailSelf = false;                     ///< cofn tail call, lowered to a back-edge
   bool hasEffectInst = false;                ///< `f[{io}](...)`
   EffectSet effectInst = 0;
-  bool hasTypeArg = false;                   ///< `id[i32](...)`
-  TypeExprPtr typeArg;
-  TypeRef typeArgument;                      ///< resolved type argument
+  bool hasTypeArg = false;                   ///< `id[i32](...)` or `id[i32, i64](...)`
+  TypeExprPtr typeArg;                       ///< first explicit type argument
+  TypeRef typeArgument;                      ///< resolved first type argument
+  std::vector<TypeExprPtr> typeArgs;
+  std::vector<TypeRef> typeArguments;
 
   CallExpr(SourceLocation l, ExprPtr c, std::vector<ExprPtr> a)
       : Expr(ExprKind::Call, std::move(l)), callee(std::move(c)), args(std::move(a)) {}
@@ -342,6 +364,29 @@ struct MethodCallExpr final : Expr {
   ExprPtr clone() const override;
 };
 
+struct CastExpr final : Expr {
+  ExprPtr operand;
+  TypeExprPtr typeExpr;
+  CastExpr(SourceLocation l, ExprPtr e, TypeExprPtr t)
+      : Expr(ExprKind::Cast, std::move(l)), operand(std::move(e)), typeExpr(std::move(t)) {}
+  ExprPtr clone() const override;
+};
+
+struct BorrowExpr final : Expr {
+  bool mut = false;
+  ExprPtr place;
+  const sema::Symbol *owner = nullptr; ///< place when it is a binding
+  BorrowExpr(SourceLocation l, bool m, ExprPtr p)
+      : Expr(ExprKind::Borrow, std::move(l)), mut(m), place(std::move(p)) {}
+  ExprPtr clone() const override;
+};
+
+struct TryExpr final : Expr {
+  ExprPtr operand;
+  TryExpr(SourceLocation l, ExprPtr e) : Expr(ExprKind::Try, std::move(l)), operand(std::move(e)) {}
+  ExprPtr clone() const override;
+};
+
 struct MatchExpr final : Expr {
   ExprPtr scrutinee;
   std::vector<MatchCase> cases;
@@ -354,7 +399,10 @@ struct MatchExpr final : Expr {
 // Statements
 // ---------------------------------------------------------------------------
 
-enum class StmtKind { VarDecl, Assign, Return, If, While, Foreach, Expr, ScopeArena, Error };
+enum class StmtKind {
+  VarDecl, Assign, Return, If, While, Foreach, Expr, ScopeArena, Unsafe, Error,
+  For, Break, Continue, IndexAssign, FieldAssign
+};
 
 struct Stmt {
   StmtKind kind;
@@ -399,6 +447,51 @@ struct IfStmt final : Stmt {
         elseBody(std::move(e)) {}
 };
 
+struct ForStmt final : Stmt {
+  std::string name;
+  ExprPtr low;
+  ExprPtr high;
+  /// `for name in iter`. `step` is the `next` call filled in by the checker.
+  ExprPtr iter;
+  ExprPtr step;
+  const sema::Symbol *someCtor = nullptr;
+  int noneTag = 0;
+  int someTag = 1;
+  Block body;
+  const sema::Symbol *binder = nullptr;
+  ForStmt(SourceLocation l, std::string n, ExprPtr a, ExprPtr b, Block body)
+      : Stmt(StmtKind::For, std::move(l)), name(std::move(n)), low(std::move(a)), high(std::move(b)),
+        body(std::move(body)) {}
+};
+
+/// `place.field = value` on a struct local or through `&mut`.
+struct FieldAssignStmt final : Stmt {
+  ExprPtr place;
+  std::string field;
+  ExprPtr value;
+  FieldAssignStmt(SourceLocation l, ExprPtr p, std::string f, ExprPtr v)
+      : Stmt(StmtKind::FieldAssign, std::move(l)), place(std::move(p)), field(std::move(f)),
+        value(std::move(v)) {}
+};
+
+struct BreakStmt final : Stmt {
+  explicit BreakStmt(SourceLocation l) : Stmt(StmtKind::Break, std::move(l)) {}
+};
+
+struct ContinueStmt final : Stmt {
+  explicit ContinueStmt(SourceLocation l) : Stmt(StmtKind::Continue, std::move(l)) {}
+};
+
+/// `place.at(index) = value`. `place` is the receiver expression.
+struct IndexAssignStmt final : Stmt {
+  ExprPtr place;
+  ExprPtr index;
+  ExprPtr value;
+  IndexAssignStmt(SourceLocation l, ExprPtr p, ExprPtr i, ExprPtr v)
+      : Stmt(StmtKind::IndexAssign, std::move(l)), place(std::move(p)), index(std::move(i)),
+        value(std::move(v)) {}
+};
+
 struct WhileStmt final : Stmt {
   ExprPtr cond;
   Block body;
@@ -419,6 +512,14 @@ struct ForeachStmt final : Stmt {
 struct ExprStmt final : Stmt {
   ExprPtr expr;
   ExprStmt(SourceLocation l, ExprPtr e) : Stmt(StmtKind::Expr, std::move(l)), expr(std::move(e)) {}
+};
+
+/// `unsafe` … `end`. Raw `ptr` values, `ptr.addr()`, `raw_slice`, and
+/// `at_unchecked` are legal only inside this block (or an `extern` declaration).
+struct UnsafeStmt final : Stmt {
+  Block body;
+  UnsafeStmt(SourceLocation l, Block b)
+      : Stmt(StmtKind::Unsafe, std::move(l)), body(std::move(b)) {}
 };
 
 /// `scope arena` … `end`.
@@ -480,18 +581,33 @@ struct LambdaExpr final : Expr {
 struct FnDecl {
   Visibility visibility = Visibility::Private;
   bool isExtern = false;
+  bool isVarArg = false; ///< trailing `...`, extern declarations only
   bool isCofn = false; ///< tail-recursive loop; state must be fixed-size
+  bool isConstFn = false; ///< evaluated by the normaliser when arguments are constant
+  bool isDrop = false;  ///< `drop Type(self: &Type)` body
+  std::string dropTypeName;
   std::string name;
   std::string effectVar; ///< binder from `fn name[e]`
   EffectSet effects = 0;
   bool effectsDeclared = false;
-  std::string typeParam;       ///< binder from `fn name[T: Type(k)]`
-  TypeExprPtr typeParamBound;  ///< the `Type(k)` written on the binder
+  std::string typeParam;       ///< first binder; kept in step with `typeBinders`
+  TypeExprPtr typeParamBound;  ///< the `Type(k)` written on the first binder
+  struct TypeBinder {
+    std::string name;
+    TypeExprPtr bound;
+    SourceLocation loc;
+  };
+  std::vector<TypeBinder> typeBinders; ///< `fn name[T: Type(k), U: Type(k)]`
+  /// The struct this `drop` cleans up. Null for ordinary functions.
+  const sema::Symbol *dropType = nullptr;
   std::vector<Param> params;
   TypeExprPtr ret; ///< null => void
-  Block body;      ///< empty for extern declarations
+  Block body;      ///< empty for extern declarations and trait signatures
   SourceLocation loc;
   sema::Symbol *symbol = nullptr;
+  /// Index into `File::impls` when this function is an impl method. The symbol
+  /// name is mangled; `name` stays the method name used by trait lookup.
+  int implIndex = -1;
 };
 
 /// `axiom name : Leak(Secret, Public)`. Erased. The only way to inhabit `Leak`.
@@ -528,9 +644,33 @@ struct TypeDecl {
   Visibility visibility = Visibility::Private;
   bool isEnum = false; ///< point constructors only; no path constructors
   std::string name;
+  std::vector<FnDecl::TypeBinder> typeBinders;
   std::vector<CtorDecl> ctors;
   SourceLocation loc;
   sema::Symbol *symbol = nullptr;
+};
+
+/// `trait Name` … `end`. Methods are signatures. `Self` is the implementing type.
+struct TraitDecl {
+  Visibility visibility = Visibility::Private;
+  std::string name;
+  /// `trait Iterator[Item: Type(0)]`. Substituted from the impl's arguments.
+  std::vector<FnDecl::TypeBinder> typeBinders;
+  std::vector<std::unique_ptr<FnDecl>> methods;
+  SourceLocation loc;
+  sema::Symbol *symbol = nullptr;
+};
+
+/// `impl Trait for Type` … `end`. Methods are owned by `File::functions`.
+struct ImplDecl {
+  Visibility visibility = Visibility::Private;
+  std::string traitPackage;
+  std::string traitName;
+  std::vector<FnDecl::TypeBinder> binders;
+  /// `impl Iterator[i64] for Range`. Empty when the brackets are binders.
+  std::vector<TypeExprPtr> traitArgs;
+  TypeExprPtr target;
+  SourceLocation loc;
 };
 
 /// Untagged product. A later field's type may mention an earlier field.
@@ -538,6 +678,7 @@ struct StructDecl {
   Visibility visibility = Visibility::Private;
   std::string name;
   std::vector<Param> fields;
+  std::vector<FnDecl::TypeBinder> typeBinders;
   SourceLocation loc;
   sema::Symbol *symbol = nullptr;
 };
@@ -575,6 +716,8 @@ struct File {
   std::vector<UseBinding> uses;
   std::vector<ExportDecl> exports;
   std::vector<std::unique_ptr<TypeDecl>> types;
+  std::vector<std::unique_ptr<TraitDecl>> traits;
+  std::vector<std::unique_ptr<ImplDecl>> impls;
   std::vector<std::unique_ptr<StructDecl>> structs;
   std::vector<std::unique_ptr<GlobalDecl>> globals;
   std::vector<std::unique_ptr<AxiomDecl>> axioms;

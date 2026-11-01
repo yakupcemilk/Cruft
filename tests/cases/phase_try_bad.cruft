@@ -1,0 +1,16 @@
+package demo
+
+import result
+
+fn parse(n: i32): result.Result(i32, i64)
+    ret result.Ok(n)
+end
+
+fn go(n: i32): result.Result(i32, i32)
+    var v = parse(n)?
+    ret result.Ok(v)
+end
+
+pub fn main(): i32
+    ret 0
+end

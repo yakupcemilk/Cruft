@@ -1,0 +1,10 @@
+package result
+
+// Result(T, E) is an inductive value. Tag 0 is Ok and tag 1 is Err.
+// `expr?` in a function that returns Result(R, E) yields T or returns the
+// error. The error type must match. There is no unwinding.
+
+pub type Result[T: Type(0), E: Type(0)]
+    Ok(value: T)
+    Err(error: E)
+end

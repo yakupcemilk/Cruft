@@ -1,0 +1,9 @@
+package demo
+
+fn both[T: Type(0), U: Type(0)](x: T, y: U): T
+    ret x
+end
+
+pub fn main(): i32
+    ret both[i32](1, 2)
+end

@@ -1,0 +1,9 @@
+package demo
+
+pub fn main(): i32
+    var xs: Vector(i32) = [1, 2, 3]
+    var view = xs.slice()
+    xs.push(4)
+    print(view.at(0))
+    ret 0
+end

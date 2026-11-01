@@ -25,6 +25,7 @@
 #include "sema/TypeChecker.h"
 #include "sema/Types.h"
 
+#include <llvm/IR/DIBuilder.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -42,6 +43,10 @@ struct CodeGenOptions {
   std::string targetTriple; ///< empty => host default
   unsigned optLevel = 0;    ///< 0..3
   std::vector<std::string> linkLibraries; ///< recorded as module metadata
+  /// `address`, `thread`, or `memory`. Empty leaves sanitizer attributes off.
+  /// The choice is an LLVM function attribute. This build does not link the
+  /// instrumentation pass; the attribute is what that pass consumes.
+  std::string sanitize;
 };
 
 class CodeGen {
@@ -92,8 +97,15 @@ private:
   llvm::Value *genArray(const ast::ArrayLitExpr &e);
   llvm::Value *genString(const ast::StringLitExpr &e);
   llvm::Value *genMethod(const ast::MethodCallExpr &e);
+  llvm::Value *genCast(const ast::CastExpr &e);
+  llvm::Value *genBorrow(const ast::BorrowExpr &e);
+  llvm::Value *genTry(const ast::TryExpr &e);
+  void setLoc(const SourceLocation &loc);
+  llvm::Function *specialize(const ast::FnDecl &fn, const std::vector<sema::TypePtr> &args);
   llvm::Value *genStruct(const ast::CallExpr &e);
-  llvm::Function *specialize(const ast::FnDecl &fn, const sema::TypePtr &arg);
+  llvm::StructType *specializedInductive(const sema::Type &t);
+  llvm::StructType *ctorPayload(const sema::Symbol &ctor, const sema::Type &inductive);
+  std::string specKey(const sema::Type &t) const;
   int runtimeField(const sema::Type &structType, size_t field);
   llvm::Function *lowerLambda(const ast::LambdaExpr &e);
 
@@ -121,6 +133,14 @@ private:
   void dropSlot(const sema::Symbol &sym);
 
   llvm::Constant *constantFor(const ast::Expr &init, const sema::Type &type);
+  llvm::Constant *constantValue(const ast::Expr &value, const sema::Type &type);
+  llvm::DIFile *debugFile(const SourceLocation &loc);
+  const sema::Type &debugSubst(const sema::Type &type) const;
+  llvm::DIType *debugType(const sema::Type &type);
+  llvm::DISubroutineType *debugSubroutine(const sema::Type &fnType);
+  void declareLocal(llvm::Value *slot, const std::string &name, const SourceLocation &loc,
+                    const sema::Type *type, bool parameter, unsigned argNo);
+  void applySanitizer();
   llvm::AllocaInst *createEntryAlloca(llvm::Type *ty, const std::string &name);
   llvm::FunctionCallee printfCallee();
   llvm::Constant *globalString(const std::string &s, const std::string &name);
@@ -159,6 +179,18 @@ private:
   std::vector<const sema::Symbol *> cofnParams_;
   std::map<const sema::Symbol *, sema::TypePtr> tySubst_;
   std::map<std::string, llvm::Function *> specs_;
+  std::map<std::string, llvm::StructType *> specStructs_;
+  std::unique_ptr<llvm::DIBuilder> dbg_;
+  llvm::DIFile *dbgFile_ = nullptr;
+  llvm::DIScope *dbgScope_ = nullptr;
+  std::map<std::string, llvm::DIFile *> dbgFiles_;
+  std::map<const sema::Type *, llvm::DIType *> dbgTypes_;
+  std::map<std::string, llvm::DIBasicType *> dbgBasics_;
+  struct LoopTarget {
+    llvm::BasicBlock *cont = nullptr;
+    llvm::BasicBlock *brk = nullptr;
+  };
+  std::vector<LoopTarget> loops_;
   int lambdaSeq_ = 0;
 };
 

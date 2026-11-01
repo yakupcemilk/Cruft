@@ -1,0 +1,23 @@
+package demo
+
+import option
+
+pub fn main(): i32
+    var m: Map(i32, i32) = []
+    m.insert(1, 10)
+    m.insert(1, 11)
+    m.insert(2, 20)
+    print(m.length())
+    print(m.contains(1))
+    var got = m.get(1)
+    var n = match got
+        case Some(v) then v
+        case None then 0
+    end
+    print(n)
+    var gone = m.remove(2)
+    print(gone)
+    print(m.contains(2))
+    print(m.length())
+    ret 0
+end

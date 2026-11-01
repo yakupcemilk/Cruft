@@ -1,0 +1,29 @@
+package demo
+
+import result
+
+fn parse(n: i32): result.Result(i32, i32)
+    if n < 0 then
+        ret result.Err(7)
+    end
+    ret result.Ok(n)
+end
+
+fn go(n: i32): result.Result(i32, i32)
+    var v = parse(n)?
+    ret result.Ok(v + 1)
+end
+
+pub fn main(): i32
+    var good = go(3)
+    var bad = go(0 - 1)
+    match good
+        case Ok(v) then print(v)
+        case Err(e) then print(e)
+    end
+    match bad
+        case Ok(v) then print(v)
+        case Err(e) then print(e)
+    end
+    ret 0
+end

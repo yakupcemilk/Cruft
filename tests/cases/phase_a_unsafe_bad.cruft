@@ -1,0 +1,8 @@
+package demo
+
+pub fn main(): i32
+    var xs: Vector(i32) = [1, 2]
+    var n: i64 = xs.data().addr()
+    print(n)
+    ret 0
+end

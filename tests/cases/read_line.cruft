@@ -3,7 +3,11 @@ package app
 import io
 
 pub fn main(): i32
-    var line: str = io.read_line()
-    io.println(line)
+    var line = io.read_line()
+    var text = match line
+        case Ok(s) then s
+        case Err(code) then ""
+    end
+    io.println(text)
     ret 0
 end

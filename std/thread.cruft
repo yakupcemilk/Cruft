@@ -1,0 +1,20 @@
+package thread
+
+// One pthread per spawn. The compiler rejects a state that is not a
+// `shared var`, so an affine buffer cannot be handed to another thread.
+// The payload is an i64. The handle is a ptr and is joined from `unsafe`.
+
+extern fn cruft_thread_spawn(work: fn(&i64): i32, state: &i64): ptr
+extern fn cruft_thread_join(handle: ptr): i32
+
+pub fn spawn(work: fn(&i64): i32, state: &i64): ptr ! {io}
+    unsafe
+        ret cruft_thread_spawn(work, state)
+    end
+end
+
+pub fn join(handle: ptr): i32 ! {io}
+    unsafe
+        ret cruft_thread_join(handle)
+    end
+end

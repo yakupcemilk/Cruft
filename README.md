@@ -123,46 +123,6 @@ Every other public symbol also has the spelling `_C_<package>_<module>_<symbol>`
 
 `import fs` loads `std/fs.cruft` (`package fs`). The same rule applies to `mem`, `slice`, `string`, `vector`, and `io`. The loader finds `std/` by walking parents until it sees `std/mem.cruft`.
 
-## Hex chunks
-
-A chunk is a dense `Vector(i32)` of block ids. A mesh that should die at the end of the frame is a `scope arena` value. A `Slice(i32)` is a `{ptr, i64}` view of those ids and does not own them.
-
-```cruft
-package chunk
-
-import fs
-import io
-
-pub fn count_solid(blocks: Vector(i32)): i32
-    var view: Slice(i32) = raw_slice(blocks.data().addr(), 4)
-    var i: i64 = 0
-    var filled: i32 = 0
-    while i < 4 do
-        if view.at(i) != 0 then
-            filled = filled + 1
-        end
-        i = i + 1
-    end
-    ret filled
-end
-
-pub fn main(): i32
-    var blocks = [1, 0, 1, 1]
-    scope arena
-        var face = [blocks.at(0), blocks.at(2)]
-        print(face.sum())
-    end
-    print(count_solid(blocks))
-    if fs.write_file("chunk.txt", "1,0,1,1") then
-        io.println(fs.read_to_string("chunk.txt"))
-    end
-    ret 0
-end
-```
-
-> [!WARNING]
-> `count_solid(blocks)` moves `blocks`. The `.at` calls in `main` happen before that move. `face` is arena memory and cannot be returned. `fs.write_file` and `fs.read_to_string` each take their strings by move, so the calls above pass literals. `io.println` writes the file text. Builtin `print` is only for numbers and `bool`.
-
 Step-by-step versions of `import`, `use`, `while`, arenas, `fs`, and `io` are in [How to Cruft?](docs/how_to_cruft.md).
 
 ## Repository

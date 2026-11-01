@@ -4,6 +4,7 @@
 #include "ast/AST.h"
 #include "Diagnostics.h"
 #include "lexer/Lexer.h"
+#include "Target.h"
 
 #include <initializer_list>
 #include <memory>
@@ -14,7 +15,8 @@ namespace cruft {
 
 class Parser {
 public:
-  Parser(std::vector<Token> tokens, std::string filename, DiagnosticEngine &diags);
+  Parser(std::vector<Token> tokens, std::string filename, DiagnosticEngine &diags,
+         TargetFacts target = {});
 
   /// Parses a whole file. Never returns null; on syntax errors the returned
   /// file is partial and `diags` carries the errors.
@@ -43,12 +45,18 @@ private:
 
   // --- declarations ---
   void parseTopLevel(ast::File &file);
-  std::unique_ptr<ast::FnDecl> parseFunction(ast::Visibility vis, bool isExtern, bool isCofn);
+  std::unique_ptr<ast::FnDecl> parseFunction(ast::Visibility vis, bool isExtern, bool isCofn,
+                                           bool signatureOnly = false);
+  void parseTrait(ast::File &file, ast::Visibility vis);
+  void parseImpl(ast::File &file, ast::Visibility vis);
+  void parseCfg(ast::File &file);
+  [[nodiscard]] bool parseCfgPredicate();
   std::unique_ptr<ast::GlobalDecl> parseGlobal(ast::Visibility vis);
   std::unique_ptr<ast::AxiomDecl> parseAxiom(ast::Visibility vis);
   std::unique_ptr<ast::TypeDecl> parseTypeDecl(ast::Visibility vis, bool isEnum);
   std::unique_ptr<ast::StructDecl> parseStruct(ast::Visibility vis);
-  std::vector<ast::Param> parseParamList();
+  std::vector<ast::Param> parseParamList(bool *varArg = nullptr);
+  std::vector<ast::FnDecl::TypeBinder> parseTypeBinders();
   std::vector<ast::Param> parseLambdaParams();
   [[nodiscard]] bool aheadIsLambda() const;
 
@@ -71,12 +79,17 @@ private:
   ast::ExprPtr parseExpr();
   ast::ExprPtr parseOr();
   ast::ExprPtr parseAnd();
+  ast::ExprPtr parseBitOr();
+  ast::ExprPtr parseBitXor();
+  ast::ExprPtr parseBitAnd();
   ast::ExprPtr parseEquality();
   ast::ExprPtr parseComparison();
+  ast::ExprPtr parseShift();
   ast::ExprPtr parseAdditive();
   ast::ExprPtr parseMultiplicative();
   ast::ExprPtr parseInterval();     ///< \/ level
   ast::ExprPtr parseIntervalMeet(); ///< /\ level
+  ast::ExprPtr parseCast();
   ast::ExprPtr parseUnary();
   ast::ExprPtr parsePostfix();
   ast::ExprPtr parsePrimary();
@@ -89,6 +102,7 @@ private:
   size_t pos_ = 0;
   std::string filename_;
   DiagnosticEngine &diags_;
+  TargetFacts target_;
   const ast::FnDecl *currentFn_ = nullptr; ///< to know whether `ret` takes a value
   /// Effect variable in scope while parsing a signature (`fn name[e]`).
   std::string effectBinder_;

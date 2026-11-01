@@ -77,9 +77,64 @@ ExprPtr mkUnary(const Expr &orig, UnaryOp op, ExprPtr x) {
 }
 
 std::int64_t wrapInt(std::int64_t v, const Type *t) {
-  if (t && t->kind == TypeKind::I32)
+  if (!t)
+    return v;
+  switch (t->kind) {
+  case TypeKind::I8:
+    return static_cast<std::int8_t>(static_cast<std::uint8_t>(static_cast<std::uint64_t>(v)));
+  case TypeKind::U8:
+    return static_cast<std::uint8_t>(static_cast<std::uint64_t>(v));
+  case TypeKind::I16:
+    return static_cast<std::int16_t>(static_cast<std::uint16_t>(static_cast<std::uint64_t>(v)));
+  case TypeKind::U16:
+    return static_cast<std::uint16_t>(static_cast<std::uint64_t>(v));
+  case TypeKind::I32:
     return static_cast<std::int32_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(v)));
-  return v;
+  case TypeKind::U32:
+    return static_cast<std::uint32_t>(static_cast<std::uint64_t>(v));
+  case TypeKind::USize:
+    if (Type::pointerBits() >= 64)
+      return v;
+    return static_cast<std::uint32_t>(static_cast<std::uint64_t>(v));
+  case TypeKind::ISize:
+    if (Type::pointerBits() >= 64)
+      return v;
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(v)));
+  default:
+    return v;
+  }
+}
+
+bool isValueArgs(const std::vector<ExprPtr> &args) {
+  for (const auto &a : args)
+    if (!a || !Normalizer::isValue(*a))
+      return false;
+  return true;
+}
+
+ExprPtr foldCast(const CastExpr &cast, const Expr &operand) {
+  const Type *to = cast.type.get();
+  const Type *from = operand.type.get();
+  if (!to || !from || to->kind == TypeKind::Ptr || from->kind == TypeKind::Ptr)
+    return nullptr;
+  if (operand.kind == ExprKind::IntLit && to->isInteger())
+    return mkInt(cast.loc, wrapInt(as<IntLitExpr>(operand).value, to), cast.type);
+  if (operand.kind == ExprKind::IntLit && to->isFloat())
+    return mkFloat(cast.loc, static_cast<double>(as<IntLitExpr>(operand).value), cast.type);
+  if (operand.kind == ExprKind::BoolLit && to->isInteger())
+    return mkInt(cast.loc, as<BoolLitExpr>(operand).value ? 1 : 0, cast.type);
+  if (operand.kind == ExprKind::FloatLit && to->isInteger())
+    return mkInt(cast.loc, wrapInt(static_cast<std::int64_t>(as<FloatLitExpr>(operand).value), to),
+                 cast.type);
+  if (operand.kind == ExprKind::FloatLit && to->isFloat()) {
+    double v = as<FloatLitExpr>(operand).value;
+    if (to->kind == TypeKind::F32)
+      v = static_cast<double>(static_cast<float>(v));
+    return mkFloat(cast.loc, v, cast.type);
+  }
+  if (operand.kind == ExprKind::BoolLit && to->kind == TypeKind::Bool)
+    return operand.clone();
+  return nullptr;
 }
 
 /// Linear polynomial over integer atoms.
@@ -290,6 +345,12 @@ bool Normalizer::mentions(const Expr &e, const Symbol *var) {
         return true;
     return false;
   }
+  case ExprKind::Cast:
+    return mentions(*as<CastExpr>(e).operand, var);
+  case ExprKind::Borrow:
+    return mentions(*as<BorrowExpr>(e).place, var);
+  case ExprKind::Try:
+    return mentions(*as<TryExpr>(e).operand, var);
   }
   return false;
 }
@@ -351,6 +412,12 @@ bool Normalizer::mentionsMutable(const Expr &e) {
         return true;
     return false;
   }
+  case ExprKind::Cast:
+    return mentionsMutable(*as<CastExpr>(e).operand);
+  case ExprKind::Borrow:
+    return mentionsMutable(*as<BorrowExpr>(e).place);
+  case ExprKind::Try:
+    return mentionsMutable(*as<TryExpr>(e).operand);
   }
   return false;
 }
@@ -488,6 +555,25 @@ ExprPtr Normalizer::substitute(const Expr &e, const Symbol *var, const Expr &wit
     n->type = substituteType(e.type, var, with);
     return n;
   }
+  case ExprKind::Cast: {
+    const auto &c = as<CastExpr>(e);
+    auto n = std::make_unique<CastExpr>(e.loc, substitute(*c.operand, var, with), c.typeExpr->clone());
+    n->type = substituteType(e.type, var, with);
+    return n;
+  }
+  case ExprKind::Borrow: {
+    const auto &b = as<BorrowExpr>(e);
+    auto n = std::make_unique<BorrowExpr>(e.loc, b.mut, substitute(*b.place, var, with));
+    n->owner = b.owner;
+    n->type = substituteType(e.type, var, with);
+    return n;
+  }
+  case ExprKind::Try: {
+    const auto &t = as<TryExpr>(e);
+    auto n = std::make_unique<TryExpr>(e.loc, substitute(*t.operand, var, with));
+    n->type = substituteType(e.type, var, with);
+    return n;
+  }
   }
   return e.clone();
 }
@@ -531,6 +617,12 @@ TypePtr Normalizer::substituteType(const TypePtr &t, const Symbol *var, const Ex
       return t;
     return Type::vector(std::move(elem), t->region,
                         t->vecLen ? substitute(*t->vecLen, var, with) : nullptr);
+  }
+  case TypeKind::Simd: {
+    TypePtr elem = substituteType(t->elem, var, with);
+    if (elem == t->elem)
+      return t;
+    return Type::simd(std::move(elem), t->lanes);
   }
   case TypeKind::Struct: {
     bool changed = false;
@@ -694,6 +786,16 @@ bool Normalizer::alphaEq(const Expr &a, const Expr &b, BinderMap &binders) {
     }
     return true;
   }
+  case ExprKind::Cast: {
+    const auto &x = as<CastExpr>(a), &y = as<CastExpr>(b);
+    return alphaEq(*x.operand, *y.operand, binders);
+  }
+  case ExprKind::Borrow: {
+    const auto &x = as<BorrowExpr>(a), &y = as<BorrowExpr>(b);
+    return x.mut == y.mut && alphaEq(*x.place, *y.place, binders);
+  }
+  case ExprKind::Try:
+    return alphaEq(*as<TryExpr>(a).operand, *as<TryExpr>(b).operand, binders);
   }
   return false;
 }
@@ -733,6 +835,8 @@ bool Normalizer::typeEqualImpl(const Type &a, const Type &b, BinderMap &binders)
   }
   case TypeKind::Inductive:
     return a.inductive == b.inductive;
+  case TypeKind::Simd:
+    return a.lanes == b.lanes && a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
   case TypeKind::Vector: {
     if (!a.elem || !b.elem || !typeEqualImpl(*a.elem, *b.elem, binders))
       return false;
@@ -767,6 +871,8 @@ bool Normalizer::typeEqualImpl(const Type &a, const Type &b, BinderMap &binders)
     return true;
   case TypeKind::Slice:
     return a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
+  case TypeKind::Ref:
+    return a.refMut == b.refMut && a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
   case TypeKind::Labeled:
     return a.secrecy == b.secrecy && a.elem && b.elem && typeEqualImpl(*a.elem, *b.elem, binders);
   case TypeKind::Leak:
@@ -776,6 +882,98 @@ bool Normalizer::typeEqualImpl(const Type &a, const Type &b, BinderMap &binders)
   default:
     return true; // primitives: same kind means same type
   }
+}
+
+// ---------------------------------------------------------------------------
+// const fn
+// ---------------------------------------------------------------------------
+
+bool Normalizer::isValue(const Expr &e) {
+  switch (e.kind) {
+  case ExprKind::IntLit:
+  case ExprKind::FloatLit:
+  case ExprKind::BoolLit:
+    return true;
+  case ExprKind::Call: {
+    const auto &call = as<CallExpr>(e);
+    if (!call.fn || call.fn->kind != SymbolKind::Type || !call.fn->type ||
+        call.fn->type->kind != TypeKind::Struct)
+      return false;
+    return isValueArgs(call.args);
+  }
+  default:
+    return false;
+  }
+}
+
+ExprPtr Normalizer::evalExpr(const Expr &e, const std::map<const Symbol *, ExprPtr> &env) {
+  ExprPtr cur = e.clone();
+  for (const auto &binding : env)
+    if (binding.first && binding.second)
+      cur = substitute(*cur, binding.first, *binding.second);
+  return norm(*cur);
+}
+
+Normalizer::Eval Normalizer::evalBlock(const Block &block,
+                                       std::map<const Symbol *, ExprPtr> &env) {
+  for (const auto &stmt : block) {
+    if (!stmt)
+      return {};
+    switch (stmt->kind) {
+    case StmtKind::VarDecl: {
+      const auto &d = static_cast<const VarDeclStmt &>(*stmt);
+      if (!d.isConst || !d.symbol || !d.init)
+        return {};
+      ExprPtr value = evalExpr(*d.init, env);
+      if (!value || !isValue(*value))
+        return {};
+      env[d.symbol] = std::move(value);
+      break;
+    }
+    case StmtKind::Return: {
+      const auto &r = static_cast<const ReturnStmt &>(*stmt);
+      Eval out;
+      out.returned = true;
+      out.value = r.value ? evalExpr(*r.value, env) : nullptr;
+      return out;
+    }
+    case StmtKind::If: {
+      const auto &i = static_cast<const IfStmt &>(*stmt);
+      if (!i.cond)
+        return {};
+      ExprPtr cond = evalExpr(*i.cond, env);
+      if (!cond || cond->kind != ExprKind::BoolLit)
+        return {};
+      std::map<const Symbol *, ExprPtr> branch;
+      for (const auto &binding : env)
+        if (binding.second)
+          branch.emplace(binding.first, binding.second->clone());
+      Eval taken = evalBlock(as<BoolLitExpr>(*cond).value ? i.thenBody : i.elseBody, branch);
+      if (taken.returned)
+        return taken;
+      break;
+    }
+    default:
+      return {};
+    }
+  }
+  return {};
+}
+
+ExprPtr Normalizer::evalConstFn(const Symbol &fn, const std::vector<ExprPtr> &args) {
+  if (!fn.fnDecl || !fn.type || fn.type->paramSymbols.size() != args.size())
+    return nullptr;
+  if (!evaluating_.insert(&fn).second)
+    return nullptr;
+  std::map<const Symbol *, ExprPtr> env;
+  for (size_t i = 0; i < args.size(); ++i)
+    if (fn.type->paramSymbols[i] && args[i])
+      env.emplace(fn.type->paramSymbols[i], args[i]->clone());
+  Eval result = evalBlock(fn.fnDecl->body, env);
+  evaluating_.erase(&fn);
+  if (!result.returned || !result.value || !isValue(*result.value))
+    return nullptr;
+  return std::move(result.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -836,11 +1034,48 @@ ExprPtr Normalizer::norm(const Expr &e) {
   }
   case ExprKind::Method: {
     const auto &m = as<MethodCallExpr>(e);
+    ExprPtr recv = norm(*m.receiver);
+    if (!m.invoked && recv && recv->kind == ExprKind::Call) {
+      const auto &ctor = as<CallExpr>(*recv);
+      const Type *st = ctor.type.get();
+      if (ctor.fn && ctor.fn->kind == SymbolKind::Type && st && st->kind == TypeKind::Struct) {
+        for (size_t i = 0; i < st->paramSymbols.size() && i < ctor.args.size(); ++i) {
+          const Symbol *field = st->paramSymbols[i];
+          if (!field || field->name != m.method || !ctor.args[i])
+            continue;
+          ExprPtr piece = ctor.args[i]->clone();
+          if (e.type)
+            piece->type = e.type;
+          return piece;
+        }
+      }
+    }
     std::vector<ExprPtr> args;
     for (const auto &a : m.args)
       args.push_back(norm(*a));
-    auto n = std::make_unique<MethodCallExpr>(e.loc, norm(*m.receiver), m.method, std::move(args),
+    auto n = std::make_unique<MethodCallExpr>(e.loc, std::move(recv), m.method, std::move(args),
                                               m.invoked);
+    n->type = e.type;
+    return n;
+  }
+  case ExprKind::Cast: {
+    const auto &c = as<CastExpr>(e);
+    ExprPtr operand = norm(*c.operand);
+    if (ExprPtr folded = foldCast(c, *operand))
+      return folded;
+    auto n = std::make_unique<CastExpr>(e.loc, std::move(operand), c.typeExpr ? c.typeExpr->clone() : nullptr);
+    n->type = e.type;
+    return n;
+  }
+  case ExprKind::Borrow: {
+    const auto &b = as<BorrowExpr>(e);
+    auto n = std::make_unique<BorrowExpr>(e.loc, b.mut, norm(*b.place));
+    n->owner = b.owner;
+    n->type = e.type;
+    return n;
+  }
+  case ExprKind::Try: {
+    auto n = std::make_unique<TryExpr>(e.loc, norm(*as<TryExpr>(e).operand));
     n->type = e.type;
     return n;
   }
@@ -1067,6 +1302,36 @@ ExprPtr Normalizer::normBinary(const BinaryExpr &e) {
       return r;
     break;
   }
+  case BinaryOp::BitAnd:
+  case BinaryOp::BitOr:
+  case BinaryOp::BitXor:
+  case BinaryOp::Shl:
+  case BinaryOp::Shr:
+    if (bothInt) {
+      const std::uint64_t a = static_cast<std::uint64_t>(iv(l));
+      const std::uint64_t b = static_cast<std::uint64_t>(iv(r));
+      std::uint64_t v = 0;
+      if (e.op == BinaryOp::BitAnd)
+        v = a & b;
+      else if (e.op == BinaryOp::BitOr)
+        v = a | b;
+      else if (e.op == BinaryOp::BitXor)
+        v = a ^ b;
+      else {
+        const unsigned width = e.type ? e.type->bitWidth() : 64;
+        if (width == 0 || b >= width)
+          break;
+        const unsigned shift = static_cast<unsigned>(b);
+        if (e.op == BinaryOp::Shl)
+          v = a << shift;
+        else if (e.type && e.type->isSignedInteger())
+          v = static_cast<std::uint64_t>(static_cast<std::int64_t>(a) >> shift);
+        else
+          v = a >> shift;
+      }
+      return mkInt(e.loc, wrapInt(static_cast<std::int64_t>(v), e.type.get()), e.type);
+    }
+    break;
   case BinaryOp::Meet:
   case BinaryOp::Join: {
     bool isMeet = e.op == BinaryOp::Meet;
@@ -1162,6 +1427,10 @@ ExprPtr Normalizer::normCall(const CallExpr &e) {
     const Symbol *callee =
         e.fn ? e.fn
              : (e.callee->kind == ExprKind::Ident ? as<IdentExpr>(*e.callee).symbol : nullptr);
+    if (callee && callee->fnDecl && callee->fnDecl->isConstFn && isValueArgs(args)) {
+      if (ExprPtr folded = evalConstFn(*callee, args))
+        return folded;
+    }
     if (const Expr *body = transparentBody(callee)) {
       const FnDecl &fn = *callee->fnDecl;
       if (callee->type && callee->type->paramSymbols.size() == args.size() &&

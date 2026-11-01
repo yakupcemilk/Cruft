@@ -26,6 +26,8 @@
 #include "sema/Types.h"
 
 #include <deque>
+#include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,6 +65,10 @@ public:
   /// Builds an identifier expression referring to `sym`.
   static ast::ExprPtr identOf(const Symbol *sym, SourceLocation loc);
 
+  /// A scalar literal, or a struct constructor whose fields are values.
+  /// This is what `const fn` evaluation and constant globals lower to.
+  static bool isValue(const ast::Expr &e);
+
 private:
   ast::ExprPtr norm(const ast::Expr &e);
   ast::ExprPtr normBinary(const ast::BinaryExpr &e);
@@ -81,8 +87,17 @@ private:
 
   const Symbol *freshIntervalVar(const std::string &hint);
 
+  struct Eval {
+    bool returned = false;
+    ast::ExprPtr value;
+  };
+  ast::ExprPtr evalConstFn(const Symbol &fn, const std::vector<ast::ExprPtr> &args);
+  Eval evalBlock(const ast::Block &block, std::map<const Symbol *, ast::ExprPtr> &env);
+  ast::ExprPtr evalExpr(const ast::Expr &e, const std::map<const Symbol *, ast::ExprPtr> &env);
+
   int fuel_ = 0;
   std::deque<Symbol> fresh_;
+  std::set<const Symbol *> evaluating_;
 };
 
 } // namespace cruft::sema

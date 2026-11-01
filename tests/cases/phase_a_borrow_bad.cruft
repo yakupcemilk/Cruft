@@ -1,0 +1,9 @@
+package demo
+
+pub fn main(): i32
+    var xs: Vector(i32) = [1]
+    var a = &mut xs
+    var b = &mut xs
+    a.push(2)
+    ret 0
+end

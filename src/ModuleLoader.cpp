@@ -32,8 +32,9 @@ std::string canonicalPath(const fs::path &path) {
 
 } // namespace
 
-ModuleLoader::ModuleLoader(DiagnosticEngine &diags, std::vector<std::string> searchPaths)
-    : diags_(diags), search_(std::move(searchPaths)) {}
+ModuleLoader::ModuleLoader(DiagnosticEngine &diags, std::vector<std::string> searchPaths,
+                           TargetFacts target)
+    : diags_(diags), target_(std::move(target)), search_(std::move(searchPaths)) {}
 
 void ModuleLoader::addSearchPath(std::string path) {
   if (!path.empty())
@@ -112,6 +113,49 @@ bool ModuleLoader::loadDependency(const std::string &package, const std::string 
   return ensurePackage(package, loc, fromFile, program);
 }
 
+bool ModuleLoader::loadPath(const std::string &package, const std::string &path, SourceLocation loc,
+                            ast::Program &program) {
+  if (package.empty() || hasPackage(program, package))
+    return true;
+  if (!loadedPaths_.insert(path).second)
+    return true;
+
+  std::string source = readAll(path);
+  if (source.empty() && !fs::is_regular_file(path)) {
+    diags_.error(loc, "cannot read '" + path + "'");
+    return false;
+  }
+
+  Lexer lexer(std::move(source), path, diags_);
+  Parser parser(lexer.tokenize(), path, diags_, target_);
+  std::unique_ptr<ast::File> file = parser.parseFile();
+  if (file->package.empty())
+    return false;
+  if (file->package != package) {
+    diags_.error(file->packageLoc, "file '" + path + "' declares package '" + file->package +
+                                       "', not '" + package + "'");
+    program.files.push_back(std::move(file));
+    return false;
+  }
+  program.files.push_back(std::move(file));
+  return true;
+}
+
+bool ModuleLoader::loadDependencyFile(const std::string &package, const std::string &path,
+                                      ast::Program &program) {
+  if (package.empty())
+    return true;
+  SourceLocation loc;
+  if (!program.files.empty())
+    loc = program.files.front()->packageLoc;
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec)) {
+    diags_.error(loc, "dependency '" + package + "' was not found at '" + path + "'");
+    return false;
+  }
+  return loadPath(package, canonicalPath(path), loc, program);
+}
+
 bool ModuleLoader::ensurePackage(const std::string &package, SourceLocation loc,
                                  const std::string &fromFile, ast::Program &program) {
   if (package.empty() || hasPackage(program, package))
@@ -124,28 +168,7 @@ bool ModuleLoader::ensurePackage(const std::string &package, SourceLocation loc,
     // packages that did load are reported there as well.
     return true;
   }
-  if (!loadedPaths_.insert(path).second)
-    return true;
-
-  std::string source = readAll(path);
-  if (source.empty() && !fs::is_regular_file(path)) {
-    diags_.error(loc, "cannot read '" + path + "'");
-    return false;
-  }
-
-  Lexer lexer(std::move(source), path, diags_);
-  Parser parser(lexer.tokenize(), path, diags_);
-  std::unique_ptr<ast::File> file = parser.parseFile();
-  if (file->package.empty())
-    return false;
-  if (file->package != package) {
-    diags_.error(file->packageLoc, "file '" + path + "' declares package '" + file->package +
-                                       "', not '" + package + "'");
-    program.files.push_back(std::move(file));
-    return false;
-  }
-  program.files.push_back(std::move(file));
-  return true;
+  return loadPath(package, path, loc, program);
 }
 
 bool ModuleLoader::resolve(ast::Program &program) {

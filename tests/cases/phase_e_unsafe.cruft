@@ -1,0 +1,9 @@
+package demo
+
+import atomic
+
+pub fn main(): i32
+    var slot: i64 = 0
+    cmpxchg(&slot, 0, 1, atomic.SeqCst, atomic.SeqCst)
+    ret 0
+end

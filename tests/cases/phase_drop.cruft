@@ -1,0 +1,16 @@
+package demo
+
+extern fn note(): i32
+
+struct File
+    handle: i32
+end
+
+drop File(self: &File)
+    print(note())
+end
+
+pub fn main(): i32
+    var f = File(1)
+    ret 0
+end

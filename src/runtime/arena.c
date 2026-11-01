@@ -3,11 +3,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#if defined(_MSC_VER)
-#define CRUFT_TLS __declspec(thread)
-#else
-#define CRUFT_TLS _Thread_local
-#endif
+/* One arena per process. The language has no threads yet, and thread-local
+ * storage crashes the MinGW 16 runtime this tree links against. */
 
 enum { CRUFT_ARENA_CHUNK = 1 << 20 };
 
@@ -30,7 +27,7 @@ typedef struct State {
   size_t mark_cap;
 } State;
 
-static CRUFT_TLS State g_arena;
+static State g_arena;
 
 static size_t align_up(size_t value, size_t align) {
   size_t rem;

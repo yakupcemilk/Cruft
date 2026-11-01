@@ -24,6 +24,11 @@ const char *binaryOpSpelling(BinaryOp op) {
   case BinaryOp::Ge: return ">=";
   case BinaryOp::And: return "and";
   case BinaryOp::Or: return "or";
+  case BinaryOp::BitAnd: return "&";
+  case BinaryOp::BitOr: return "|";
+  case BinaryOp::BitXor: return "^";
+  case BinaryOp::Shl: return "<<";
+  case BinaryOp::Shr: return ">>";
   case BinaryOp::Meet: return "/\\";
   case BinaryOp::Join: return "\\/";
   }
@@ -61,6 +66,7 @@ TypeExprPtr TypeExpr::clone() const {
   t->effectVar = effectVar;
   t->effectsDeclared = effectsDeclared;
   t->level = level;
+  t->refMut = refMut;
   return t;
 }
 
@@ -68,6 +74,7 @@ namespace {
 template <class T> std::unique_ptr<T> withType(std::unique_ptr<T> n, const Expr &src) {
   n->type = src.type;
   n->flow = src.flow;
+  n->loanOwner = src.loanOwner;
   return n;
 }
 } // namespace
@@ -109,7 +116,25 @@ ExprPtr CallExpr::clone() const {
     n->typeArg = typeArg->clone();
   if (along)
     n->along = along->clone();
+  for (const auto &ta : typeArgs)
+    if (ta)
+      n->typeArgs.push_back(ta->clone());
+  n->typeArguments = typeArguments;
   return withType(std::move(n), *this);
+}
+
+ExprPtr CastExpr::clone() const {
+  return withType(std::make_unique<CastExpr>(loc, operand->clone(), typeExpr->clone()), *this);
+}
+
+ExprPtr BorrowExpr::clone() const {
+  auto n = std::make_unique<BorrowExpr>(loc, mut, place->clone());
+  n->owner = owner;
+  return withType(std::move(n), *this);
+}
+
+ExprPtr TryExpr::clone() const {
+  return withType(std::make_unique<TryExpr>(loc, operand->clone()), *this);
 }
 
 ExprPtr TypeLitExpr::clone() const {
@@ -353,6 +378,26 @@ void print(std::ostream &os, const Expr &e) {
     os << " end";
     break;
   }
+  case ExprKind::Cast: {
+    const auto &c = static_cast<const CastExpr &>(e);
+    os << '(';
+    print(os, *c.operand);
+    os << " as ";
+    print(os, *c.typeExpr);
+    os << ')';
+    break;
+  }
+  case ExprKind::Borrow: {
+    const auto &b = static_cast<const BorrowExpr &>(e);
+    os << (b.mut ? "&mut " : "&");
+    print(os, *b.place);
+    break;
+  }
+  case ExprKind::Try: {
+    print(os, *static_cast<const TryExpr &>(e).operand);
+    os << '?';
+    break;
+  }
   }
 }
 
@@ -441,6 +486,11 @@ void print(std::ostream &os, const TypeExpr &t) {
     if (t.rhs)
       print(os, *t.rhs);
     os << ')';
+    break;
+  case TypeExprKind::Ref:
+    os << (t.refMut ? "&mut " : "&");
+    if (t.elem)
+      print(os, *t.elem);
     break;
   }
 }

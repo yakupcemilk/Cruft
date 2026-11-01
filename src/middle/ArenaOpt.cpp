@@ -27,6 +27,9 @@ std::optional<std::uint64_t> primitiveSize(sema::TypeKind kind) {
   case sema::TypeKind::I64:
   case sema::TypeKind::F64:
     return 8;
+  case sema::TypeKind::USize:
+  case sema::TypeKind::ISize:
+    return sema::Type::pointerBits() / 8;
   default:
     return std::nullopt;
   }
@@ -168,6 +171,18 @@ void visitExpr(Expr &expr, Summary &summary) {
   case ExprKind::IntervalLit:
   case ExprKind::StringLit:
     break;
+  case ExprKind::Cast:
+    if (static_cast<CastExpr &>(expr).operand)
+      visitExpr(*static_cast<CastExpr &>(expr).operand, summary);
+    break;
+  case ExprKind::Borrow:
+    if (static_cast<BorrowExpr &>(expr).place)
+      visitExpr(*static_cast<BorrowExpr &>(expr).place, summary);
+    break;
+  case ExprKind::Try:
+    if (static_cast<TryExpr &>(expr).operand)
+      visitExpr(*static_cast<TryExpr &>(expr).operand, summary);
+    break;
   }
 }
 
@@ -204,6 +219,40 @@ void visitStmt(Stmt &stmt, Summary &summary, bool inArena) {
     visitBlock(w.body, summary, inArena);
     break;
   }
+  case StmtKind::For: {
+    auto &f = static_cast<ForStmt &>(stmt);
+    if (f.low)
+      visitExpr(*f.low, summary);
+    if (f.high)
+      visitExpr(*f.high, summary);
+    if (f.iter)
+      visitExpr(*f.iter, summary);
+    if (f.step)
+      visitExpr(*f.step, summary);
+    visitBlock(f.body, summary, inArena);
+    break;
+  }
+  case StmtKind::FieldAssign: {
+    auto &a = static_cast<FieldAssignStmt &>(stmt);
+    if (a.place)
+      visitExpr(*a.place, summary);
+    if (a.value)
+      visitExpr(*a.value, summary);
+    break;
+  }
+  case StmtKind::IndexAssign: {
+    auto &ix = static_cast<IndexAssignStmt &>(stmt);
+    if (ix.place)
+      visitExpr(*ix.place, summary);
+    if (ix.index)
+      visitExpr(*ix.index, summary);
+    if (ix.value)
+      visitExpr(*ix.value, summary);
+    break;
+  }
+  case StmtKind::Break:
+  case StmtKind::Continue:
+    break;
   case StmtKind::Foreach:
     visitBlock(static_cast<ForeachStmt &>(stmt).body, summary, inArena);
     break;
@@ -212,6 +261,9 @@ void visitStmt(Stmt &stmt, Summary &summary, bool inArena) {
       visitExpr(*static_cast<ExprStmt &>(stmt).expr, summary);
     break;
   case StmtKind::Error:
+    break;
+  case StmtKind::Unsafe:
+    visitBlock(static_cast<UnsafeStmt &>(stmt).body, summary, inArena);
     break;
   case StmtKind::ScopeArena: {
     auto &arena = static_cast<ScopeArenaStmt &>(stmt);

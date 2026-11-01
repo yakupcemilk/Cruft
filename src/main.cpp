@@ -10,11 +10,17 @@
 //   -O0 | -O1 | -O2 | -O3
 //   --target <triple> cross-compile for the given LLVM target triple
 //   --module <name>   LLVM module identifier (default: first package name)
+//   --sanitize <name> pass address, thread, or memory through to LLVM
+//   --lock            rewrite cruft.lock from [dependencies]
+//   --fmt             print a formatted copy of each input
+//   --fmt-check       exit 1 when an input is not formatted
 //
 // All input files are compiled as one compilation unit so that packages can
 // reference each other; the package name comes from `package <name>` inside
 // each file, never from the file name.
 #include "codegen/CodeGen.h"
+#include "Format.h"
+#include "Target.h"
 #include "Diagnostics.h"
 #include "lexer/Lexer.h"
 #include "Manifest.h"
@@ -45,9 +51,13 @@ struct Options {
   std::string moduleName;
   std::string manifest;
   std::string cc;
+  std::string sanitize;
   OutputKind kind = OutputKind::LLVMIR;
   unsigned optLevel = 0;
   bool link = false;
+  bool updateLock = false;
+  bool format = false;
+  bool formatCheck = false;
 };
 
 void usage(std::ostream &os) {
@@ -64,6 +74,10 @@ void usage(std::ostream &os) {
         "  --lib <dir>        directory searched for imported packages\n"
         "  --link             link an executable (requires --cc)\n"
         "  --cc <path>        C compiler used by --link\n"
+        "  --sanitize <name>  address, thread, or memory (LLVM sanitizer attribute)\n"
+        "  --lock             write cruft.lock beside the manifest\n"
+        "  --fmt              print formatted source\n"
+        "  --fmt-check        fail when an input is not formatted\n"
         "  -h, --help         show this help\n";
 }
 
@@ -112,6 +126,22 @@ bool parseArgs(int argc, char **argv, Options &opts) {
       opts.cc = v;
     } else if (a == "--link") {
       opts.link = true;
+    } else if (a == "--lock") {
+      opts.updateLock = true;
+    } else if (a == "--fmt") {
+      opts.format = true;
+    } else if (a == "--fmt-check") {
+      opts.formatCheck = true;
+    } else if (a == "--sanitize") {
+      const char *v = needValue("--sanitize");
+      if (!v)
+        return false;
+      std::string name = v;
+      if (name != "address" && name != "thread" && name != "memory") {
+        std::cerr << "cruftc: unknown sanitizer '" << name << "'\n";
+        return false;
+      }
+      opts.sanitize = std::move(name);
     } else if (a == "-emit-llvm") {
       opts.kind = OutputKind::LLVMIR;
     } else if (a == "-c") {
@@ -201,6 +231,14 @@ bool linkExecutable(const Options &opts, const cruft::Manifest &manifest, const 
     if (std::string iort = findUp(opts.inputs.front(), fs::path("src") / "runtime" / "io.c");
         !iort.empty())
       cmd.push_back(std::move(iort));
+    if (std::string fmtrt = findUp(opts.inputs.front(), fs::path("src") / "runtime" / "fmt.c");
+        !fmtrt.empty())
+      cmd.push_back(std::move(fmtrt));
+    if (std::string threads = findUp(opts.inputs.front(), fs::path("src") / "runtime" / "thread.c");
+        !threads.empty()) {
+      cmd.push_back(std::move(threads));
+      cmd.push_back("-pthread");
+    }
   }
   cmd.push_back("-o");
   cmd.push_back(output);
@@ -233,6 +271,26 @@ int main(int argc, char **argv) {
     std::cerr << "cruftc: --link requires --cc <compiler>\n";
     return 2;
   }
+  if (opts.format || opts.formatCheck) {
+    int status = 0;
+    for (const std::string &path : opts.inputs) {
+      std::string source;
+      if (!readFile(path, source)) {
+        std::cerr << "cruftc: cannot read '" << path << "'\n";
+        return 1;
+      }
+      std::string formatted = cruft::formatSource(source);
+      if (opts.formatCheck) {
+        if (formatted != source) {
+          std::cerr << "cruftc: would reformat '" << path << "'\n";
+          status = 1;
+        }
+      } else {
+        std::cout << formatted;
+      }
+    }
+    return status;
+  }
 
   cruft::DiagnosticEngine diags;
   cruft::ast::Program program;
@@ -241,14 +299,25 @@ int main(int argc, char **argv) {
   std::string manifestPath = opts.manifest;
   if (manifestPath.empty())
     manifestPath = cruft::Manifest::discover(opts.inputs.front());
+  std::vector<cruft::ResolvedDependency> resolvedDeps;
   if (!manifestPath.empty()) {
     if (!manifest.loadFile(manifestPath, diags)) {
       diags.print(std::cerr);
       return 1;
     }
+    if (!manifest.lockDependencies(manifestPath, diags, opts.updateLock, resolvedDeps)) {
+      diags.print(std::cerr);
+      return 1;
+    }
+  } else if (opts.updateLock) {
+    std::cerr << "cruftc: --lock needs a manifest\n";
+    return 2;
   }
   if (opts.target.empty())
     opts.target = manifest.targetTriple;
+  const cruft::TargetFacts target = cruft::TargetFacts::from(opts.target);
+  opts.target = target.triple;
+  cruft::sema::Type::setPointerBits(target.pointerBits);
 
   // ---- Lex + Parse every input ------------------------------------------
   for (const std::string &path : opts.inputs) {
@@ -259,15 +328,15 @@ int main(int argc, char **argv) {
     }
     cruft::Lexer lexer(std::move(source), path, diags);
     std::vector<cruft::Token> tokens = lexer.tokenize();
-    cruft::Parser parser(std::move(tokens), path, diags);
+    cruft::Parser parser(std::move(tokens), path, diags, target);
     program.files.push_back(parser.parseFile());
   }
 
-  cruft::ModuleLoader loader(diags, opts.libPaths);
+  cruft::ModuleLoader loader(diags, opts.libPaths, target);
   for (const std::string &path : manifest.modulePaths)
     loader.addSearchPath(path);
-  for (const std::string &dep : manifest.dependencies) {
-    if (!loader.loadDependency(dep, opts.inputs.front(), program)) {
+  for (const cruft::ResolvedDependency &dep : resolvedDeps) {
+    if (!loader.loadDependencyFile(dep.name, dep.absolute, program)) {
       diags.print(std::cerr);
       return 1;
     }
@@ -302,6 +371,7 @@ int main(int argc, char **argv) {
   cgOpts.targetTriple = opts.target;
   cgOpts.optLevel = opts.optLevel;
   cgOpts.linkLibraries = manifest.libraries;
+  cgOpts.sanitize = opts.sanitize;
   cruft::CodeGen codegen(program, checker, diags, moduleName, cgOpts);
   if (!codegen.generate()) {
     diags.print(std::cerr);

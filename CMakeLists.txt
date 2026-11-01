@@ -88,6 +88,8 @@ add_library(cruft_frontend STATIC
   src/Diagnostics.cpp
   src/Manifest.cpp
   src/ModuleLoader.cpp
+  src/Format.cpp
+  src/Target.cpp
 )
 target_include_directories(cruft_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_include_directories(cruft_frontend SYSTEM PUBLIC ${CRUFT_LLVM_INCLUDE_DIRS})

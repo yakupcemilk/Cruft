@@ -1,0 +1,20 @@
+package demo
+
+trait Two
+    fn one(self: &Self): i32
+    fn two(self: &Self): i32
+end
+
+struct Box
+    n: i32
+end
+
+impl Two for Box
+    fn one(self: &Box): i32
+        ret 1
+    end
+end
+
+pub fn main(): i32
+    ret 0
+end

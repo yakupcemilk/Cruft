@@ -1,0 +1,6 @@
+package demo
+
+pub fn main(): i32
+    break
+    ret 0
+end

@@ -17,6 +17,8 @@ void cruft_free(int64_t addr);
 int64_t cruft_realloc(int64_t addr, int64_t nbytes);
 /* Index outside [0, len). Prints to stderr and aborts. */
 void cruft_bounds_fail(void);
+/* Print message and abort. Used by assert and trap. Does not unwind. */
+void cruft_trap(const char *message);
 
 #ifdef __cplusplus
 }

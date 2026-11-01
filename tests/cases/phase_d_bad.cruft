@@ -1,0 +1,5 @@
+package demo
+
+pub fn main(argc: i32): i32
+    ret argc
+end
