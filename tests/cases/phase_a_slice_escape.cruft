@@ -1,0 +1,10 @@
+package demo
+
+pub fn leaked(): Slice(i32)
+    var xs: Vector(i32) = [1, 2, 3]
+    ret xs.slice()
+end
+
+pub fn main(): i32
+    ret 0
+end

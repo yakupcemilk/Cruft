@@ -1,0 +1,35 @@
+package demo
+
+import atomic
+import thread
+
+pub fn worker(state: &i64): i32
+    unsafe
+        atomicrmw(atomic.Add, state, 10, atomic.Relaxed)
+    end
+    ret 7
+end
+
+pub fn main(): i32
+    unsafe
+        var slot: i64 = 0
+        cmpxchg(&slot, 0, 41, atomic.SeqCst, atomic.SeqCst)
+        print(slot)
+        var v: Simd(i32, 4) = simd(1, 2, 3, 4)
+        var w: Simd(i32, 4) = simd(10, 0, 0, 0)
+        var sum = simd_add(v, w)
+        print(simd_extract(sum, 0))
+        asm("nop")
+    end
+    shared var buf = [1, 2, 3]
+    var alias = buf
+    print(alias.length())
+    shared var counter: i64 = 0
+    unsafe
+        var handle = thread.spawn(worker, &counter)
+        var rc = thread.join(handle)
+        print(rc)
+        print(counter)
+    end
+    ret 0
+end

@@ -16,6 +16,14 @@ TypePtr Type::primitive(TypeKind k) {
   return t;
 }
 
+TypePtr Type::i8() {
+  static TypePtr t = primitive(TypeKind::I8);
+  return t;
+}
+TypePtr Type::i16() {
+  static TypePtr t = primitive(TypeKind::I16);
+  return t;
+}
 TypePtr Type::i32() {
   static TypePtr t = primitive(TypeKind::I32);
   return t;
@@ -24,6 +32,38 @@ TypePtr Type::i64() {
   static TypePtr t = primitive(TypeKind::I64);
   return t;
 }
+TypePtr Type::u8() {
+  static TypePtr t = primitive(TypeKind::U8);
+  return t;
+}
+TypePtr Type::u16() {
+  static TypePtr t = primitive(TypeKind::U16);
+  return t;
+}
+TypePtr Type::u32() {
+  static TypePtr t = primitive(TypeKind::U32);
+  return t;
+}
+TypePtr Type::u64() {
+  static TypePtr t = primitive(TypeKind::U64);
+  return t;
+}
+TypePtr Type::usize() {
+  static TypePtr t = primitive(TypeKind::USize);
+  return t;
+}
+TypePtr Type::isize() {
+  static TypePtr t = primitive(TypeKind::ISize);
+  return t;
+}
+
+namespace {
+unsigned gPointerBits = 64;
+}
+
+void Type::setPointerBits(unsigned bits) { gPointerBits = bits == 32 ? 32u : 64u; }
+
+unsigned Type::pointerBits() { return gPointerBits; }
 TypePtr Type::f32() {
   static TypePtr t = primitive(TypeKind::F32);
   return t;
@@ -87,7 +127,8 @@ TypePtr Type::equiv(TypePtr a, TypePtr b) {
 TypePtr Type::fn(std::vector<TypePtr> params, std::vector<const Symbol *> paramSymbols,
                  TypePtr ret, std::vector<ast::Usage> paramUse, ast::EffectSet effects,
                  std::string effectVar, bool effectsDeclared, const Symbol *typeParam,
-                 int typeParamLevel) {
+                 int typeParamLevel, bool varArg, std::vector<const Symbol *> typeParams,
+                 std::vector<int> typeParamLevels) {
   auto t = std::make_shared<Type>();
   t->kind = TypeKind::Fn;
   t->params = std::move(params);
@@ -103,7 +144,52 @@ TypePtr Type::fn(std::vector<TypePtr> params, std::vector<const Symbol *> paramS
   t->effectsDeclared = effectsDeclared;
   t->typeParam = typeParam;
   t->typeParamLevel = typeParamLevel;
+  t->varArg = varArg;
+  t->typeParams = std::move(typeParams);
+  t->typeParamLevels = std::move(typeParamLevels);
+  if (t->typeParams.empty() && typeParam) {
+    t->typeParams.push_back(typeParam);
+    t->typeParamLevels.push_back(typeParamLevel);
+  }
+  if (!t->typeParams.empty()) {
+    t->typeParam = t->typeParams.front();
+    t->typeParamLevel = t->typeParamLevels.empty() ? 0 : t->typeParamLevels.front();
+  }
   return t;
+}
+
+TypePtr Type::refTy(TypePtr elem, bool mut, int region) {
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::Ref;
+  t->elem = std::move(elem);
+  t->refMut = mut;
+  t->region = region;
+  return t;
+}
+
+unsigned Type::bitWidth() const {
+  switch (kind) {
+  case TypeKind::I8:
+  case TypeKind::U8:
+  case TypeKind::Bool:
+    return 8;
+  case TypeKind::I16:
+  case TypeKind::U16:
+    return 16;
+  case TypeKind::I32:
+  case TypeKind::U32:
+  case TypeKind::F32:
+    return 32;
+  case TypeKind::I64:
+  case TypeKind::U64:
+  case TypeKind::F64:
+    return 64;
+  case TypeKind::USize:
+  case TypeKind::ISize:
+    return pointerBits();
+  default:
+    return 0;
+  }
 }
 
 TypePtr Type::labeled(TypePtr elem, ast::Secrecy secrecy) {
@@ -191,6 +277,14 @@ TypePtr Type::stringTy(int region) {
   return t;
 }
 
+TypePtr Type::simd(TypePtr elem, int lanes) {
+  auto t = std::make_shared<Type>();
+  t->kind = TypeKind::Simd;
+  t->elem = std::move(elem);
+  t->lanes = lanes;
+  return t;
+}
+
 TypePtr Type::slice(TypePtr elem, int region) {
   auto t = std::make_shared<Type>();
   t->kind = TypeKind::Slice;
@@ -206,8 +300,16 @@ TypePtr Type::ptr() {
 
 bool Type::isCCompatible() const {
   switch (kind) {
+  case TypeKind::I8:
+  case TypeKind::I16:
   case TypeKind::I32:
   case TypeKind::I64:
+  case TypeKind::U8:
+  case TypeKind::U16:
+  case TypeKind::U32:
+  case TypeKind::U64:
+  case TypeKind::USize:
+  case TypeKind::ISize:
   case TypeKind::F32:
   case TypeKind::F64:
   case TypeKind::Bool:
@@ -224,6 +326,9 @@ bool Type::isCCompatible() const {
     return ret && ret->isCCompatible();
   case TypeKind::Slice:
     return elem && elem->isCCompatible();
+  case TypeKind::Ref:
+    return elem && elem->isCCompatible() && elem->kind != TypeKind::Fn &&
+           elem->kind != TypeKind::Slice && elem->kind != TypeKind::Ref;
   default:
     return false;
   }
@@ -231,8 +336,16 @@ bool Type::isCCompatible() const {
 
 std::string Type::str() const {
   switch (kind) {
+  case TypeKind::I8: return "i8";
+  case TypeKind::I16: return "i16";
   case TypeKind::I32: return "i32";
   case TypeKind::I64: return "i64";
+  case TypeKind::U8: return "u8";
+  case TypeKind::U16: return "u16";
+  case TypeKind::U32: return "u32";
+  case TypeKind::U64: return "u64";
+  case TypeKind::USize: return "usize";
+  case TypeKind::ISize: return "isize";
   case TypeKind::F32: return "f32";
   case TypeKind::F64: return "f64";
   case TypeKind::Bool: return "bool";
@@ -265,6 +378,8 @@ std::string Type::str() const {
       s += params[i]->str();
     }
     s += ")";
+    if (varArg)
+      s += params.empty() ? "..." : ", ...";
     if (ret && ret->kind != TypeKind::Void)
       s += ": " + ret->str();
     if (effectsDeclared) {
@@ -310,6 +425,10 @@ std::string Type::str() const {
     return "String";
   case TypeKind::Slice:
     return "Slice(" + (elem ? elem->str() : std::string("?")) + ")";
+  case TypeKind::Ref:
+    return std::string(refMut ? "&mut " : "&") + (elem ? elem->str() : "?");
+  case TypeKind::Simd:
+    return "Simd(" + (elem ? elem->str() : std::string("?")) + ", " + std::to_string(lanes) + ")";
   }
   return "?";
 }

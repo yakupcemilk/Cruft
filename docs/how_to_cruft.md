@@ -4,10 +4,15 @@ Quick reference for the language `cruftc` parses today. Packages are one identif
 
 | Need | Rule |
 |---|---|
-| 64-bit integer | `i64`. The other integer is `i32`. Both are signed |
+| Integers | `i8` `i16` `i32` `i64` and `u8` `u16` `u32` `u64`. No implicit width or signedness conversion |
+| Cast | `expr as Type`, just outside unary, so `-1 as i64` casts the negated value |
+| Bitwise | `\|` then `^` then `&`, then comparisons, then `<<` `>>`. `~` is bitwise not on integers |
 | Text type | `str` and `String` are the same type |
-| `Vector(T).length()` | `i32` |
-| `Slice(T).length()` and `.at(i)` | `i64` |
+| `.length()` | `i64` on `Vector`, `Map`, `String`, and `Slice` |
+| `for` | `for i in low .. high do ... end` is an exclusive `i64` loop. `break` and `continue` apply to `while` and `for` |
+| References | `&T` and `&mut T`. A borrow does not move the owner. Overlapping `&mut` is not tracked statement by statement |
+| `drop` | one `drop Name(self: &Name)` per struct. It runs before the fields are freed and is not part of the C ABI |
+| `?` | early `ret` of `Result` or `Option`. Not an unwind |
 | Numbers on stdout | builtin `print` |
 | Text on stdout | `io.print` / `io.println` |
 
@@ -19,7 +24,8 @@ Quick reference for the language `cruftc` parses today. Packages are one identif
 4. [Scope arenas](#scope-arenas)
 5. [Standard library](#standard-library)
 6. [A chunk, end to end](#a-chunk-end-to-end)
-7. [Compile commands](#compile-commands)
+7. [Mutation, generics, and errors](#mutation-generics-and-errors)
+8. [Compile commands](#compile-commands)
 
 ## Packages, imports, and visibility
 
@@ -137,14 +143,14 @@ end
 
 | Type | Meaning |
 |---|---|
-| `i32`, `i64` | Signed integers. A literal is `i64` when the expected type is `i64`, and `i32` otherwise |
+| `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` | Integers. A literal takes the expected integer type when it fits, and stays `i32` otherwise |
 | `f32`, `f64` | IEEE floats. An integer literal in a float position is that float |
 | `bool` | `true` or `false` |
 | `ptr` | Untyped C pointer. `null()` is the null pointer. `p.addr()` is that address as `i64` |
-| `str`, `String` | One owned byte buffer. `.length()` is `i32`. `.byte_len()` is `i64`. `.data()` is a NUL-terminated `ptr` for as long as the value is alive. `.set_len(n)` updates a named variable |
+| `str`, `String` | One owned byte buffer. `.length()` and `.byte_len()` are `i64`. `.data()` is a NUL-terminated `ptr` for as long as the value is alive. `.set_len(n)` and `.append` update a named variable or an `&mut` place. `.bytes()` is `Slice(u8)` |
 | `Slice(T)` | `{ptr, i64}`. Does not own the bytes. `.length()` is the element count, an `i64` |
-| `Vector(T)` | Owned heap buffer. `.length()` is `i32`. Methods: `.data()`, `.at(i)`, `.sum()`, `.filter`, `.map` |
-| `Map(K, V)` | Owned map. `.insert(key, value)` updates a named variable. `.contains(key)` returns `bool`. `.length()` is `i32` |
+| `Vector(T)` | Owned heap buffer. `.length()` is `i64`. Methods: `.data()`, `.at(i)`, `.sum()`, `.filter`, `.map`, `.push`, `.pop`, `.set`, `.reserve`, `.clear` |
+| `Map(K, V)` | Open-addressed map. `.insert` replaces an equal key. `.remove` tombstones. `.contains` is `bool`. `.get` is `option.Option` after `import option`. `.length()` is `i64` |
 
 > [!IMPORTANT]
 > `Vector`, `Map`, and `String` are affine. A function argument moves the value. Using it again is an error. Methods do not move the receiver. `shared var` stores a reference count so two names can share one buffer. The last drop frees it through `cruft_free`. `i32`, `i64`, `f32`, `f64`, `bool`, `ptr`, and `Slice(T)` are copied.
@@ -232,7 +238,7 @@ pub fn main(): i32
 end
 ```
 
-`while` uses `do` and ends with `end`. `.at` takes an `i64`. On a `Vector`, `.length()` is an `i32`, so this loop uses a literal bound of `4`, which is `i64` because `i` is `i64`. The vector has four elements, so every index is in range.
+`while` uses `do` and ends with `end`. `.at` takes an `i64`, and `.length()` is an `i64`. The vector has four elements, so every index is in range.
 
 ```cruft
 package demo
@@ -319,7 +325,7 @@ end
 | Call | Result |
 |---|---|
 | `fs.write_file(path: str, content: str): bool` | Creates or replaces the file in binary mode. `true` only when every byte is written and `fclose` returns 0 |
-| `fs.read_to_string(path: str): String` | The whole file, binary mode, as an owned `String`. `""` when open, seek, or read fails |
+| `fs.read_to_string(path: str): Result(String, i32)` | The whole file, binary mode. `Ok("")` is an empty file. `Err` is `1` open, `2` seek, `3` read, `4` alloc |
 | `fs.exists(path: str): bool` | `true` when the path is visible (`_access` / `access`) |
 
 Under those functions the runtime calls `fopen`, `fread`, `fwrite`, `fseek` / `ftell` (64-bit offset: `_fseeki64` or `fseeko`), and `fclose`, through `cruft_fopen`, `cruft_fread`, `cruft_fwrite`, `cruft_fseek`, `cruft_ftell`, `cruft_fclose`, and `cruft_exists`.
@@ -340,25 +346,30 @@ pub fn main(): i32
     if not fs.exists("note.txt") then
         ret 2
     end
-    io.println(fs.read_to_string("note.txt"))
+    var body = fs.read_to_string("note.txt")
+    var text = match body
+        case Ok(s) then s
+        case Err(code) then ""
+    end
+    io.println(text)
     ret 0
 end
 ```
 
-`io.println` receives the `String` returned by `read_to_string` and writes `hello` plus a newline.
+`read_to_string` returns `result.Result(String, i32)`. `Ok` carries the file bytes. `io.println` writes `hello` plus a newline.
 
 ### Streams
 
 `import io` reads `std/io.cruft`. Link `src/runtime/io.c` and `src/runtime/mem.c`.
 
-Builtin `print` accepts `i32`, `i64`, `f32`, `f64`, and `bool`, and writes a newline. It does not accept `str`.
+Builtin `print` accepts every integer width, `f32`, `f64`, and `bool`, and writes a newline. It does not accept `str`. Narrow integers are extended to 32 bits for `printf`. `u32` prints unsigned, `i64` and `u64` print as 64-bit.
 
 | Call | Result |
 |---|---|
 | `io.print(msg: str)` | The bytes of `msg` on stdout. No added newline |
 | `io.println(msg: str)` | `io.print(msg)`, then `"\n"` |
 | `io.eprint(msg: str)` | The bytes of `msg` on stderr |
-| `io.read_line(): String` | One stdin line, at most 4096 bytes, with the trailing newline removed. `""` on EOF or a failed read |
+| `io.read_line(): Result(String, i32)` | One stdin line, at most 4096 bytes, with the trailing newline removed. `Ok("")` is a blank line. `Err(1)` is EOF or a failed read |
 | `io.stdout()`, `io.stderr()`, `io.stdin()` | The C stream as `ptr` |
 
 ```cruft
@@ -369,7 +380,11 @@ import io
 pub fn main(): i32
     io.print("count=")
     print(3)
-    var line: str = io.read_line()
+    var got = io.read_line()
+    var line = match got
+        case Ok(s) then s
+        case Err(code) then ""
+    end
     io.println(line)
     ret 0
 end
@@ -427,7 +442,12 @@ pub fn main(): i32
     end
     print(count_solid())
     if fs.write_file("chunk.txt", "solid") then
-        io.println(fs.read_to_string("chunk.txt"))
+        var body = fs.read_to_string("chunk.txt")
+        var text = match body
+            case Ok(s) then s
+            case Err(code) then ""
+        end
+        io.println(text)
     end
     ret 0
 end
@@ -438,6 +458,28 @@ cruftc --link --cc gcc -o chunk chunk.cruft
 ```
 
 `--link` adds `arena.c`, `mem.c`, `fs.c`, and `io.c` from `src/runtime/` when those files are found above the source.
+
+## Mutation, generics, and errors
+
+`Vector` has `push`, `pop`, `set`, `reserve`, and `clear`. `String` has `append` and `bytes` (`Slice(u8)`). `Map` is an open-addressed table: `insert` replaces an equal key, `remove` leaves a tombstone, `contains` is `bool`, and `get` returns `option.Option` when `import option` is in scope. `place.at(i) = value` stores through a named `var` or an `&mut` place. The index is `i64`.
+
+```cruft
+var xs: Vector(i32) = []
+xs.push(1)
+xs.at(0) = 9
+```
+
+Functions take binders in brackets, `fn id[T: Type(0), U: Type(0)](x: T): U`. Data takes them the same way and is used with parentheses: `struct Pair[T: Type(0), U: Type(0)]` is `Pair(i32, i64)`. A single binder can be inferred. Several binders need an explicit list. Only specialisations are emitted.
+
+`&x` and `&mut xs` borrow a place. A call argument of reference type auto-borrows a matching place. The borrow does not move the owner. Returning a borrow of a local, or of a value inside `scope arena`, is rejected. Two `&mut` uses in one scope are not tracked against each other.
+
+```cruft
+drop File(self: &File)
+    cruft_fclose(self.handle)
+end
+```
+
+`import result` provides `Result(T, E)` with `Ok` and `Err`. `import option` provides `Option(T)` with `None` and `Some`. `expr?` returns early from a function whose result type matches. `fs.read_to_string` returns `Result(String, i32)` (`1` open, `2` seek, `3` read, `4` alloc). `io.read_line` returns `Result(String, i32)` (`1` for EOF). An empty success is `Ok("")`. `assert(cond)` and `trap("...")` call `cruft_trap` and abort.
 
 ## Compile commands
 

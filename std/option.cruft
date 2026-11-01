@@ -1,0 +1,10 @@
+package option
+
+// Option(T) is an inductive value, not a new compiler type. Tag 0 is None
+// and tag 1 is Some. `expr?` in a function that returns Option yields the
+// Some payload or returns None.
+
+pub type Option[T: Type(0)]
+    None
+    Some(value: T)
+end

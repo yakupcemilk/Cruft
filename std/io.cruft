@@ -1,9 +1,11 @@
 package io
 
+import result
+
 // Standard streams. `import io` loads std/io.cruft.
 // print and println write bytes to stdout. read_line takes one line from
-// stdin and returns it without the trailing newline. A closed stream or EOF
-// yields an empty String.
+// stdin and returns it without the trailing newline. EOF or a failed read
+// is Err(1). A blank line is Ok("").
 
 extern fn cruft_stdout(): ptr
 extern fn cruft_stderr(): ptr
@@ -12,36 +14,50 @@ extern fn cruft_io_write(data: ptr, len: i64, stream: ptr)
 extern fn cruft_read_line(buf: ptr, cap: i64): i64
 
 pub fn stdout(): ptr ! {io}
-    ret cruft_stdout()
+    unsafe
+        ret cruft_stdout()
+    end
 end
 
 pub fn stderr(): ptr ! {io}
-    ret cruft_stderr()
+    unsafe
+        ret cruft_stderr()
+    end
 end
 
 pub fn stdin(): ptr ! {io}
-    ret cruft_stdin()
+    unsafe
+        ret cruft_stdin()
+    end
 end
 
 pub fn print(msg: str) ! {io}
-    cruft_io_write(msg.data(), msg.byte_len(), stdout())
+    unsafe
+        cruft_io_write(msg.data(), msg.byte_len(), stdout())
+    end
 end
 
 pub fn println(msg: str) ! {io}
-    print(msg)
-    cruft_io_write("\n".data(), 1, stdout())
+    unsafe
+        print(msg)
+        cruft_io_write("\n".data(), 1, stdout())
+    end
 end
 
 pub fn eprint(msg: str) ! {io}
-    cruft_io_write(msg.data(), msg.byte_len(), stderr())
+    unsafe
+        cruft_io_write(msg.data(), msg.byte_len(), stderr())
+    end
 end
 
-pub fn read_line(): String ! {io, alloc}
-    var buf: String = alloc_string(4096)
-    var n: i64 = cruft_read_line(buf.data(), 4097)
-    if n < 0 then
-        ret ""
+pub fn read_line(): result.Result(String, i32) ! {io, alloc}
+    unsafe
+        var buf: String = alloc_string(4096)
+        var n: i64 = cruft_read_line(buf.data(), 4097)
+        if n < 0 then
+            ret result.Err(1)
+        end
+        buf.set_len(n)
+        ret result.Ok(buf)
     end
-    buf.set_len(n)
-    ret buf
 end

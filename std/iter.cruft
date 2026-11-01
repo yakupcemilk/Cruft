@@ -1,0 +1,30 @@
+package iter
+
+import option
+
+// Half-open range. `range(1, 4)` yields 1, then 2, then 3.
+// `for x in it` calls `next` until it returns None.
+
+pub struct Range
+    cur: i64
+    stop: i64
+end
+
+pub fn range(start: i64, stop: i64): Range
+    ret Range(start, stop)
+end
+
+pub trait Iterator[Item: Type(0)]
+    fn next(self: &mut Self): option.Option(Item)
+end
+
+pub impl Iterator[i64] for Range
+    fn next(self: &mut Range): option.Option(i64)
+        if self.cur >= self.stop then
+            ret option.None
+        end
+        var n = self.cur
+        self.cur = n + 1
+        ret option.Some(n)
+    end
+end

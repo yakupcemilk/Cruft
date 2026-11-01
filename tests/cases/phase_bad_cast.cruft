@@ -1,0 +1,7 @@
+package demo
+
+pub fn main(): i32
+    var s = "no"
+    var n: i32 = s as i32
+    ret n
+end

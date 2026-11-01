@@ -51,11 +51,29 @@ enum class TokenKind {
   KwAxiom,
   KwStruct,
   KwEnum,
+  KwAs,      ///< `expr as Type`
+  KwFor,     ///< `for i in low .. high`
+  KwBreak,
+  KwContinue,
+  KwDrop,    ///< user cleanup `drop Name(self: &Name)`
+  KwMut,     ///< `&mut T`
+  KwUnsafe,  ///< `unsafe` … `end` raw-memory boundary
+  KwTrait,   ///< `trait Name` … `end`
+  KwImpl,    ///< `impl Trait for Type` … `end`
+  KwCfg,     ///< `cfg` … `end` selects on the target triple
 
   // primitive / built-in type names (lexed as keywords so the parser can
   // tell type positions from identifiers without a symbol table)
+  KwI8,
+  KwI16,
   KwI32,
   KwI64,
+  KwU8,
+  KwU16,
+  KwU32,
+  KwU64,
+  KwUSize, ///< `usize` - unsigned pointer width
+  KwISize, ///< `isize` - signed pointer width
   KwF32,
   KwF64,
   KwBool,
@@ -81,6 +99,8 @@ enum class TokenKind {
   Comma,
   Colon,
   Dot,
+  DotDot,       ///< `..` exclusive range in `for`
+  Ellipsis,     ///< `...` extern varargs
   Assign,       ///< =
   Plus,
   Minus,
@@ -94,6 +114,12 @@ enum class TokenKind {
   LessEq,
   Greater,      ///< >
   GreaterEq,
+  ShiftL,       ///< <<
+  ShiftR,       ///< >>
+  Amp,          ///< &   bitwise and, or the start of `&T`
+  Pipe,         ///< |
+  Caret,        ///< ^
+  Question,     ///< ?   Result / Option propagation
   At,           ///< @   path application
   Tilde,        ///< ~   interval reversal
   Meet,         ///< /\  interval min

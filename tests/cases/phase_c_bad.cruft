@@ -1,0 +1,13 @@
+package demo
+
+fn inc(x: i32): i32
+    ret x + 1
+end
+
+const fn bad(x: i32): i32
+    ret inc(x)
+end
+
+pub fn main(): i32
+    ret bad(1)
+end

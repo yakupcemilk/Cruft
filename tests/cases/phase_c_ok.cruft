@@ -1,0 +1,63 @@
+package demo
+
+const fn square(x: i32): i32
+    const y = x * x
+    ret y
+end
+
+const fn add(a: i32, b: i32): i32
+    ret a + b
+end
+
+const fn twice(x: i32): i32
+    ret add(x, x)
+end
+
+struct Pair
+    a: i32
+    b: i32
+end
+
+const fn both(n: i32): Pair
+    if n < 0 then
+        ret Pair(0, 0)
+    else
+        ret Pair(n, n + 1)
+    end
+end
+
+const fn first(p: Pair): i32
+    ret p.a
+end
+
+const N: i32 = square(6)
+const P: Pair = both(3)
+
+cfg os linux
+    fn bad(): i32
+        ret true
+    end
+end
+
+cfg os windows
+    cfg arch x86_64
+        const fn flag(): i32
+            ret 7
+        end
+    end
+end
+
+cfg not os windows
+    const fn flag(): i32
+        ret 9
+    end
+end
+
+pub fn main(): i32
+    print(N)
+    print(first(P))
+    print(square(4))
+    print(twice(5))
+    print(flag())
+    ret 0
+end

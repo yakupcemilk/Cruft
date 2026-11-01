@@ -1,0 +1,15 @@
+package demo
+
+import thread
+
+pub fn worker(state: &i64): i32
+    ret 0
+end
+
+pub fn main(): i32
+    var n: i64 = 0
+    unsafe
+        var handle = thread.spawn(worker, &n)
+        ret 0
+    end
+end

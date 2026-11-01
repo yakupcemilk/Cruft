@@ -29,8 +29,18 @@ const std::unordered_map<std::string_view, TokenKind> &keywordTable() {
       {"aff", TokenKind::KwAff},         {"foreach", TokenKind::KwForeach},
       {"cofn", TokenKind::KwCofn},       {"along", TokenKind::KwAlong},
       {"axiom", TokenKind::KwAxiom},     {"struct", TokenKind::KwStruct},
-      {"enum", TokenKind::KwEnum},       {"i32", TokenKind::KwI32},
-      {"i64", TokenKind::KwI64},         {"f32", TokenKind::KwF32},
+      {"enum", TokenKind::KwEnum},       {"as", TokenKind::KwAs},
+      {"for", TokenKind::KwFor},         {"break", TokenKind::KwBreak},
+      {"continue", TokenKind::KwContinue}, {"drop", TokenKind::KwDrop},
+      {"mut", TokenKind::KwMut},         {"unsafe", TokenKind::KwUnsafe},
+      {"trait", TokenKind::KwTrait},     {"impl", TokenKind::KwImpl},
+      {"cfg", TokenKind::KwCfg},
+      {"i8", TokenKind::KwI8},
+      {"i16", TokenKind::KwI16},         {"i32", TokenKind::KwI32},
+      {"i64", TokenKind::KwI64},         {"u8", TokenKind::KwU8},
+      {"u16", TokenKind::KwU16},         {"u32", TokenKind::KwU32},
+      {"u64", TokenKind::KwU64},         {"usize", TokenKind::KwUSize},
+      {"isize", TokenKind::KwISize},     {"f32", TokenKind::KwF32},
       {"f64", TokenKind::KwF64},         {"bool", TokenKind::KwBool},
       {"ptr", TokenKind::KwPtr},
       {"I", TokenKind::KwInterval},      {"Type", TokenKind::KwUniverse},
@@ -82,8 +92,26 @@ std::string_view tokenKindName(TokenKind k) {
   case TokenKind::KwAxiom: return "'axiom'";
   case TokenKind::KwStruct: return "'struct'";
   case TokenKind::KwEnum: return "'enum'";
+  case TokenKind::KwAs: return "'as'";
+  case TokenKind::KwFor: return "'for'";
+  case TokenKind::KwBreak: return "'break'";
+  case TokenKind::KwContinue: return "'continue'";
+  case TokenKind::KwDrop: return "'drop'";
+  case TokenKind::KwMut: return "'mut'";
+  case TokenKind::KwUnsafe: return "'unsafe'";
+  case TokenKind::KwTrait: return "'trait'";
+  case TokenKind::KwImpl: return "'impl'";
+  case TokenKind::KwCfg: return "'cfg'";
+  case TokenKind::KwI8: return "'i8'";
+  case TokenKind::KwI16: return "'i16'";
   case TokenKind::KwI32: return "'i32'";
   case TokenKind::KwI64: return "'i64'";
+  case TokenKind::KwU8: return "'u8'";
+  case TokenKind::KwU16: return "'u16'";
+  case TokenKind::KwU32: return "'u32'";
+  case TokenKind::KwU64: return "'u64'";
+  case TokenKind::KwUSize: return "'usize'";
+  case TokenKind::KwISize: return "'isize'";
   case TokenKind::KwF32: return "'f32'";
   case TokenKind::KwF64: return "'f64'";
   case TokenKind::KwBool: return "'bool'";
@@ -105,6 +133,8 @@ std::string_view tokenKindName(TokenKind k) {
   case TokenKind::Comma: return "','";
   case TokenKind::Colon: return "':'";
   case TokenKind::Dot: return "'.'";
+  case TokenKind::DotDot: return "'..'";
+  case TokenKind::Ellipsis: return "'...'";
   case TokenKind::Assign: return "'='";
   case TokenKind::Plus: return "'+'";
   case TokenKind::Minus: return "'-'";
@@ -118,6 +148,12 @@ std::string_view tokenKindName(TokenKind k) {
   case TokenKind::LessEq: return "'<='";
   case TokenKind::Greater: return "'>'";
   case TokenKind::GreaterEq: return "'>='";
+  case TokenKind::ShiftL: return "'<<'";
+  case TokenKind::ShiftR: return "'>>'";
+  case TokenKind::Amp: return "'&'";
+  case TokenKind::Pipe: return "'|'";
+  case TokenKind::Caret: return "'^'";
+  case TokenKind::Question: return "'?'";
   case TokenKind::At: return "'@'";
   case TokenKind::Tilde: return "'~'";
   case TokenKind::Meet: return "'/\\'";
@@ -309,7 +345,26 @@ std::vector<Token> Lexer::tokenize() {
         kind = TokenKind::Colon;
       }
       break;
-    case '.': advance(); kind = TokenKind::Dot; break;
+    case '.':
+      advance();
+      if (peek() == '.') {
+        advance();
+        if (peek() == '.') {
+          advance();
+          kind = TokenKind::Ellipsis;
+          text = "...";
+        } else {
+          kind = TokenKind::DotDot;
+          text = "..";
+        }
+      } else {
+        kind = TokenKind::Dot;
+      }
+      break;
+    case '&': advance(); kind = TokenKind::Amp; break;
+    case '|': advance(); kind = TokenKind::Pipe; break;
+    case '^': advance(); kind = TokenKind::Caret; break;
+    case '?': advance(); kind = TokenKind::Question; break;
     case '+': advance(); kind = TokenKind::Plus; break;
     case '*': advance(); kind = TokenKind::Star; break;
     case '%': advance(); kind = TokenKind::Percent; break;
@@ -333,8 +388,34 @@ std::vector<Token> Lexer::tokenize() {
         kind = TokenKind::Assign;
       }
       break;
-    case '<': kind = two('=', TokenKind::LessEq, TokenKind::Less); break;
-    case '>': kind = two('=', TokenKind::GreaterEq, TokenKind::Greater); break;
+    case '<':
+      advance();
+      if (peek() == '<') {
+        advance();
+        kind = TokenKind::ShiftL;
+        text = "<<";
+      } else if (peek() == '=') {
+        advance();
+        kind = TokenKind::LessEq;
+        text = "<=";
+      } else {
+        kind = TokenKind::Less;
+      }
+      break;
+    case '>':
+      advance();
+      if (peek() == '>') {
+        advance();
+        kind = TokenKind::ShiftR;
+        text = ">>";
+      } else if (peek() == '=') {
+        advance();
+        kind = TokenKind::GreaterEq;
+        text = ">=";
+      } else {
+        kind = TokenKind::Greater;
+      }
+      break;
     case '/': kind = two('\\', TokenKind::Meet, TokenKind::Slash); break;
     case '\\': kind = two('/', TokenKind::Join, TokenKind::Invalid); break;
     case '!':

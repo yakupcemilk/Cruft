@@ -1,0 +1,17 @@
+package demo
+
+fn both[T: Type(0), U: Type(0)](x: T, y: U): T
+    ret x
+end
+
+struct Pair[T: Type(0), U: Type(0)]
+    x: T
+    y: U
+end
+
+pub fn main(): i32
+    print(both[i32, i64](4, 9))
+    var p: Pair(i32, i64) = Pair(3, 5)
+    print(p.x)
+    ret 0
+end

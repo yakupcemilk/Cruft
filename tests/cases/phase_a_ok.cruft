@@ -1,0 +1,29 @@
+package demo
+
+fn bump(xs: &mut Vector(i32))
+    xs.push(1)
+end
+
+pub fn main(): i32
+    var xs: Vector(i32) = [10, 20, 30]
+    if true then
+        var a = &xs
+        var b = &xs
+        print(a.length())
+        print(b.at(0))
+    end
+    if true then
+        var m = &mut xs
+        m.push(40)
+    end
+    bump(&mut xs)
+    bump(&mut xs)
+    unsafe
+        var raw: Slice(i32) = raw_slice(xs.data().addr(), xs.length())
+        print(raw.at_unchecked(1))
+    end
+    var view = xs.slice()
+    print(view.length())
+    print(view.at(2))
+    ret 0
+end

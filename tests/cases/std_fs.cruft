@@ -4,12 +4,22 @@ import fs
 import io
 
 pub fn main(): i32
-    if not fs.write_file("cruft_std_io.txt", "hello") then
+    var wrote = fs.write_file("cruft_std_io.txt", "hello")
+    var failed = match wrote
+        case Ok(n) then false
+        case Err(code) then true
+    end
+    if failed then
         ret 1
     end
     if not fs.exists("cruft_std_io.txt") then
         ret 2
     end
-    io.println(fs.read_to_string("cruft_std_io.txt"))
+    var body = fs.read_to_string("cruft_std_io.txt")
+    var text = match body
+        case Ok(s) then s
+        case Err(code) then ""
+    end
+    io.println(text)
     ret 0
 end

@@ -36,3 +36,11 @@ void cruft_bounds_fail(void) {
   fputs("cruft: index out of bounds\n", stderr);
   abort();
 }
+
+void cruft_trap(const char *message) {
+  if (message && message[0])
+    fputs(message, stderr);
+  else
+    fputs("cruft: trap\n", stderr);
+  abort();
+}

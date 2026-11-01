@@ -6,9 +6,9 @@ package string
 // until the value is dropped, which calls cruft_free.
 // `str` is the same type as String: a borrowed view is just a use that does
 // not move the owner. `.data()` stays valid while that value is alive.
-// `.length()` is the byte count as i32. `.byte_len()` is the full i64 count.
+// `.length()` and `.byte_len()` are both the byte count as i64.
 
-pub fn len(s: str): i32
+pub fn len(s: str): i64
     ret s.length()
 end
 
@@ -17,5 +17,7 @@ pub fn byte_len(s: str): i64
 end
 
 pub fn bytes(s: str): ptr
-    ret s.data()
+    unsafe
+        ret s.data()
+    end
 end

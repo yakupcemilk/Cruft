@@ -29,8 +29,46 @@ const std::map<std::string, Builtin> &builtinTable() {
       {"reveal", Builtin::Reveal},
       {"quot", Builtin::Quot},
       {"text", Builtin::Text},
+      {"assert", Builtin::Assert},
+      {"trap", Builtin::Trap},
+      {"cmpxchg", Builtin::CmpXchg},
+      {"atomicrmw", Builtin::AtomicRmw},
+      {"atomic_load", Builtin::AtomicLoad},
+      {"atomic_store", Builtin::AtomicStore},
+      {"simd", Builtin::Simd},
+      {"simd_add", Builtin::SimdAdd},
+      {"simd_extract", Builtin::SimdExtract},
+      {"asm", Builtin::Asm},
   };
   return table;
+}
+
+const Symbol *nullaryCtor(const Expr &e) {
+  if (e.kind != ExprKind::Call)
+    return nullptr;
+  const auto &c = as<CallExpr>(e);
+  if (!c.fn || c.fn->kind != SymbolKind::Ctor || !c.args.empty() || !c.fn->owner)
+    return nullptr;
+  return c.fn;
+}
+
+int orderRank(const std::string &name) {
+  if (name == "Relaxed")
+    return 1;
+  if (name == "Acquire" || name == "Release")
+    return 2;
+  if (name == "AcqRel")
+    return 3;
+  if (name == "SeqCst")
+    return 4;
+  return 0;
+}
+
+bool atomicWidth(const Type &t) {
+  if (!t.isInteger())
+    return false;
+  const unsigned bits = t.bitWidth();
+  return bits == 8 || bits == 16 || bits == 32 || bits == 64;
 }
 
 } // namespace
@@ -53,6 +91,7 @@ bool TypeChecker::check() {
   resolveSignatures();
   if (diags_.hasErrors())
     return false;
+  checkConstFunctions();
   checkGlobals();
   checkFunctionBodies();
   return !diags_.hasErrors();
@@ -314,12 +353,28 @@ void TypeChecker::collectFile(File &file) {
   for (auto &fn : file.functions) {
     Symbol fs;
     fs.kind = SymbolKind::Function;
-    fs.name = fn->name;
-    fs.visibility = fn->visibility;
+    if (fn->implIndex >= 0) {
+      // The method name stays on the declaration for diagnostics and trait
+      // lookup. The symbol name is unique so two `len` witnesses do not collide.
+      fs.name = "__impl_" + std::to_string(implSerial_++) + "_" + fn->name;
+      fs.visibility = Visibility::Private;
+    } else {
+      fs.name = fn->name;
+      fs.visibility = fn->visibility;
+    }
     fs.loc = fn->loc;
     fs.isExtern = fn->isExtern;
     fs.fnDecl = fn.get();
     fn->symbol = declare(std::move(fs));
+  }
+
+  for (auto &tr : file.traits) {
+    Symbol ts;
+    ts.kind = SymbolKind::Trait;
+    ts.name = tr->name;
+    ts.visibility = tr->visibility;
+    ts.loc = tr->loc;
+    tr->symbol = declare(std::move(ts));
   }
 
   for (auto &ax : file.axioms) {
@@ -412,21 +467,45 @@ void TypeChecker::ensureNotLeakingPrivate(const Type &t, const SourceLocation &l
 }
 
 void TypeChecker::resolveSignatures() {
-  for (auto &file : program_.files) {
-    if (file->package.empty())
-      continue;
-    file_ = file.get();
-    package_ = file->package;
-    resolveFileSignatures(*file);
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) {
+      for (auto &file : program_.files) {
+        if (file->package.empty())
+          continue;
+        file_ = file.get();
+        package_ = file->package;
+        resolveTraits(*file);
+      }
+    }
+    for (auto &file : program_.files) {
+      if (file->package.empty())
+        continue;
+      file_ = file.get();
+      package_ = file->package;
+      // Types and structs first, across every file, so a later package can
+      // name Result(String, i32) after result's binders exist.
+      resolveFileSignatures(*file, pass == 1);
+    }
   }
 }
 
-void TypeChecker::resolveFileSignatures(File &file) {
+void TypeChecker::resolveFileSignatures(File &file, bool functions) {
+  if (functions)
+    goto resolve_functions;
   // --- inductive types: point constructors first, then path constructors
   //     (path constructor boundaries mention point constructors).
   for (auto &td : file.types) {
     if (!td->symbol)
       continue;
+    pushScope();
+    td->symbol->typeBinders = openTypeBinders(td->typeBinders);
+    if (td->symbol->type) {
+      auto edited = std::const_pointer_cast<Type>(td->symbol->type);
+      edited->typeParams = td->symbol->typeBinders;
+      edited->typeParamLevels.clear();
+      for (const Symbol *b : td->symbol->typeBinders)
+        edited->typeParamLevels.push_back(b && b->type ? b->type->level : 0);
+    }
     for (int pass = 0; pass < 2; ++pass) {
       for (auto &ctor : td->ctors) {
         if (!ctor.symbol || (ctor.pathType != nullptr) != (pass == 1))
@@ -471,6 +550,7 @@ void TypeChecker::resolveFileSignatures(File &file) {
             params.empty() ? result : Type::fn(std::move(params), std::move(paramSyms), result);
       }
     }
+    popScope();
   }
 
   // --- structs (dependent fields see the symbols of earlier fields)
@@ -478,6 +558,7 @@ void TypeChecker::resolveFileSignatures(File &file) {
     if (!sd->symbol)
       continue;
     pushScope();
+    sd->symbol->typeBinders = openTypeBinders(sd->typeBinders);
     std::vector<TypePtr> fields;
     std::vector<const Symbol *> fieldSyms;
     for (auto &field : sd->fields) {
@@ -495,10 +576,18 @@ void TypeChecker::resolveFileSignatures(File &file) {
     }
     popScope();
     sd->symbol->type = Type::structOf(sd->symbol, std::move(fields), std::move(fieldSyms));
+    {
+      auto edited = std::const_pointer_cast<Type>(sd->symbol->type);
+      edited->typeParams = sd->symbol->typeBinders;
+      for (const Symbol *b : sd->symbol->typeBinders)
+        edited->typeParamLevels.push_back(b && b->type ? b->type->level : 0);
+    }
     if (sd->visibility == Visibility::Public)
       ensureNotLeakingPrivate(*sd->symbol->type, sd->loc, "public struct '" + sd->name + "'");
   }
 
+  return;
+resolve_functions:
   // --- globals
   for (auto &g : file.globals) {
     if (!g->symbol)
@@ -513,78 +602,11 @@ void TypeChecker::resolveFileSignatures(File &file) {
       ensureNotLeakingPrivate(*t, g->loc, "public variable '" + g->name + "'");
   }
 
-  // --- functions
+  // --- functions. Impl methods are resolved with their impl's binders below.
   for (auto &fn : file.functions) {
-    if (!fn->symbol)
+    if (!fn->symbol || fn->implIndex >= 0)
       continue;
-    pushScope();
-    const Symbol *typeParam = nullptr;
-    int typeParamLevel = -1;
-    if (!fn->typeParam.empty()) {
-      if (!fn->typeParamBound)
-        diags_.error(fn->loc, "type binder '" + fn->typeParam + "' needs a universe, as in [T: Type(0)]");
-      else {
-        TypePtr bound = resolveType(*fn->typeParamBound);
-        if (bound->kind != TypeKind::Universe)
-          diags_.error(fn->typeParamBound->loc, "type binder '" + fn->typeParam +
-                                                    "' must be bounded by a universe, found '" +
-                                                    bound->str() + "'");
-        else
-          typeParamLevel = bound->level;
-      }
-      Symbol ts;
-      ts.kind = SymbolKind::TypeParam;
-      ts.name = fn->typeParam;
-      ts.type = Type::universe(typeParamLevel < 0 ? 0 : typeParamLevel);
-      ts.loc = fn->loc;
-      typeParam = declareLocal(std::move(ts));
-    }
-    std::vector<TypePtr> params;
-    std::vector<const Symbol *> paramSyms;
-    std::vector<Usage> paramUses;
-    for (auto &p : fn->params) {
-      TypePtr pt = resolveType(*p.type);
-      if (isStaticOnlyType(*pt))
-        diags_.error(p.loc, "parameter '" + p.name + "' has static-only type '" + pt->str() +
-                                "'; type-level data must be known at compile time");
-      if (lookupLocal(p.name))
-        diags_.error(p.loc, "duplicate parameter name '" + p.name + "'");
-      Symbol ps;
-      ps.kind = SymbolKind::Param;
-      ps.name = p.name;
-      ps.type = pt;
-      ps.loc = p.loc;
-      ps.usage = resolveUsage(p.usage, *pt, false, false);
-      paramSyms.push_back(declareLocal(std::move(ps)));
-      params.push_back(pt);
-      paramUses.push_back(paramSyms.back()->usage);
-    }
-    TypePtr ret = fn->ret ? resolveType(*fn->ret) : Type::voidTy();
-    popScope();
-
-    std::string rowVar = fn->effectsDeclared && fn->effects == 0 ? fn->effectVar : std::string{};
-    TypePtr fnType = Type::fn(params, paramSyms, ret, paramUses, fn->effects, rowVar,
-                              fn->effectsDeclared, typeParam, typeParamLevel);
-    fn->symbol->type = fnType;
-
-    if (fn->isExtern && typeParam)
-      diags_.error(fn->loc, "extern function '" + fn->name + "' cannot have a type binder");
-
-    if (fn->isExtern) {
-      // FFI: everything crossing the boundary must have a C layout.
-      for (size_t i = 0; i < params.size(); ++i)
-        if (!params[i]->isCCompatible() && !params[i]->isError())
-          diags_.error(fn->params[i].loc,
-                       "extern function '" + fn->name + "': parameter '" + fn->params[i].name +
-                           "' has type '" + params[i]->str() +
-                           "' which is not C-ABI compatible (allowed: i32, i64, f32, f64, bool, ptr, "
-                           "Slice(T), and C-compatible function pointers)");
-      if (!ret->isCCompatible() && !ret->isError())
-        diags_.error(fn->loc, "extern function '" + fn->name + "': return type '" + ret->str() +
-                                  "' is not C-ABI compatible");
-    } else if (fn->visibility == Visibility::Public) {
-      ensureNotLeakingPrivate(*fnType, fn->loc, "public function '" + fn->name + "'");
-    }
+    assignFunctionType(*fn, nullptr);
   }
 
   for (auto &ax : file.axioms) {
@@ -596,14 +618,587 @@ void TypeChecker::resolveFileSignatures(File &file) {
       diags_.error(ax->loc, "axiom '" + ax->name + "' must inhabit a Leak type, found '" + t->str() +
                                 "'");
   }
+
+  for (auto &fn : file.functions) {
+    if (!fn->isDrop)
+      continue;
+    Symbol *target = nullptr;
+    for (auto &sd : file.structs)
+      if (sd->name == fn->dropTypeName)
+        target = sd->symbol;
+    if (!target) {
+      diags_.error(fn->loc, "drop target '" + fn->dropTypeName + "' is not a struct in this package");
+      continue;
+    }
+    if (target->dropFn) {
+      diags_.error(fn->loc, "struct '" + fn->dropTypeName + "' already has a drop");
+      continue;
+    }
+    target->dropFn = fn.get();
+    if (fn->params.size() != 1 || !fn->symbol || !fn->symbol->type ||
+        fn->symbol->type->params.size() != 1 || !fn->symbol->type->params[0] ||
+        fn->symbol->type->params[0]->kind != TypeKind::Ref ||
+        !fn->symbol->type->params[0]->elem ||
+        fn->symbol->type->params[0]->elem->inductive != target)
+      diags_.error(fn->loc, "drop " + fn->dropTypeName + " must take one '&" + fn->dropTypeName +
+                                "' parameter");
+  }
+
+  resolveImpls(file);
+}
+
+void TypeChecker::assignFunctionType(FnDecl &fn, const std::vector<const Symbol *> *sharedBinders) {
+  if (!fn.symbol)
+    return;
+  const bool ownScope = sharedBinders == nullptr;
+  if (ownScope)
+    pushScope();
+  std::vector<const Symbol *> typeParams =
+      sharedBinders ? *sharedBinders : openTypeBinders(fn.typeBinders);
+  std::vector<int> typeLevels;
+  for (const Symbol *b : typeParams)
+    typeLevels.push_back(b && b->type ? b->type->level : 0);
+  const Symbol *typeParam = typeParams.empty() ? nullptr : typeParams.front();
+  int typeParamLevel = typeLevels.empty() ? -1 : typeLevels.front();
+  if ((fn.effects & effectNet) != 0)
+    diags_.warning(fn.loc, "effect 'net' has no runtime; the row is checked and then ignored");
+  std::vector<TypePtr> params;
+  std::vector<const Symbol *> paramSyms;
+  std::vector<Usage> paramUses;
+  for (auto &p : fn.params) {
+    if (!p.type) {
+      diags_.error(p.loc, "parameter '" + p.name + "' needs a type");
+      params.push_back(Type::error());
+      paramSyms.push_back(nullptr);
+      paramUses.push_back(Usage::Many);
+      continue;
+    }
+    TypePtr pt = resolveType(*p.type);
+    if (isStaticOnlyType(*pt))
+      diags_.error(p.loc, "parameter '" + p.name + "' has static-only type '" + pt->str() +
+                              "'; type-level data must be known at compile time");
+    if (lookupLocal(p.name))
+      diags_.error(p.loc, "duplicate parameter name '" + p.name + "'");
+    Symbol ps;
+    ps.kind = SymbolKind::Param;
+    ps.name = p.name;
+    ps.type = pt;
+    ps.loc = p.loc;
+    ps.usage = resolveUsage(p.usage, *pt, false, false);
+    paramSyms.push_back(declareLocal(std::move(ps)));
+    params.push_back(pt);
+    paramUses.push_back(paramSyms.back()->usage);
+  }
+  TypePtr ret = fn.ret ? resolveType(*fn.ret) : Type::voidTy();
+  if (ownScope)
+    popScope();
+
+  std::string rowVar = fn.effectsDeclared && fn.effects == 0 ? fn.effectVar : std::string{};
+  TypePtr fnType = Type::fn(std::move(params), paramSyms, ret, paramUses, fn.effects, rowVar,
+                            fn.effectsDeclared, typeParam, typeParamLevel, fn.isVarArg,
+                            typeParams, typeLevels);
+  fn.symbol->type = fnType;
+
+  if (fn.isExtern && typeParam)
+    diags_.error(fn.loc, "extern function '" + fn.name + "' cannot have a type binder");
+
+  if (fn.isExtern) {
+    for (size_t i = 0; i < fnType->params.size(); ++i)
+      if (fnType->params[i] && !fnType->params[i]->isCCompatible() && !fnType->params[i]->isError())
+        diags_.error(fn.params[i].loc,
+                     "extern function '" + fn.name + "': parameter '" + fn.params[i].name +
+                         "' has type '" + fnType->params[i]->str() +
+                         "' which is not C-ABI compatible (allowed: i32, i64, usize, isize, f32, f64, "
+                         "bool, ptr, Slice(T), and C-compatible function pointers)");
+    if (ret && !ret->isCCompatible() && !ret->isError())
+      diags_.error(fn.loc, "extern function '" + fn.name + "': return type '" + ret->str() +
+                               "' is not C-ABI compatible");
+  } else if (fn.visibility == Visibility::Public) {
+    ensureNotLeakingPrivate(*fnType, fn.loc, "public function '" + fn.name + "'");
+  }
+}
+
+namespace {
+
+int binderSlot(const Symbol *sym, const std::vector<const Symbol *> &binders) {
+  if (!sym)
+    return -1;
+  for (size_t i = 0; i < binders.size(); ++i)
+    if (binders[i] == sym)
+      return static_cast<int>(i);
+  return -1;
+}
+
+} // namespace
+
+bool TypeChecker::typeMentions(const Type &type, const Symbol *var) const {
+  if (!var)
+    return false;
+  if (type.kind == TypeKind::TyVar && type.tyVar == var)
+    return true;
+  if (type.elem && typeMentions(*type.elem, var))
+    return true;
+  if (type.a && typeMentions(*type.a, var))
+    return true;
+  if (type.b && typeMentions(*type.b, var))
+    return true;
+  if (type.ret && typeMentions(*type.ret, var))
+    return true;
+  for (const auto &p : type.params)
+    if (p && typeMentions(*p, var))
+      return true;
+  for (const auto &arg : type.typeArgs)
+    if (arg && typeMentions(*arg, var))
+      return true;
+  return false;
+}
+
+bool TypeChecker::traitTypesEqual(const Type &a, const Type &b) {
+  if (a.kind != b.kind)
+    return false;
+  switch (a.kind) {
+  case TypeKind::Ref:
+    return a.refMut == b.refMut && a.elem && b.elem && traitTypesEqual(*a.elem, *b.elem);
+  case TypeKind::Fn: {
+    if (a.params.size() != b.params.size() || !a.ret || !b.ret)
+      return false;
+    for (size_t i = 0; i < a.params.size(); ++i)
+      if (!a.params[i] || !b.params[i] || !traitTypesEqual(*a.params[i], *b.params[i]))
+        return false;
+    return traitTypesEqual(*a.ret, *b.ret);
+  }
+  case TypeKind::Vector:
+  case TypeKind::Slice:
+    return a.elem && b.elem && traitTypesEqual(*a.elem, *b.elem);
+  case TypeKind::Labeled:
+    return a.secrecy == b.secrecy && a.elem && b.elem && traitTypesEqual(*a.elem, *b.elem);
+  case TypeKind::Struct: {
+    if (a.inductive != b.inductive || a.params.size() != b.params.size() ||
+        a.typeArgs.size() != b.typeArgs.size())
+      return false;
+    for (size_t i = 0; i < a.typeArgs.size(); ++i)
+      if (!a.typeArgs[i] || !b.typeArgs[i] || !traitTypesEqual(*a.typeArgs[i], *b.typeArgs[i]))
+        return false;
+    for (size_t i = 0; i < a.params.size(); ++i)
+      if (!a.params[i] || !b.params[i] || !traitTypesEqual(*a.params[i], *b.params[i]))
+        return false;
+    return true;
+  }
+  case TypeKind::TyVar:
+    return a.tyVar == b.tyVar;
+  case TypeKind::Map:
+    return a.a && b.a && a.b && b.b && traitTypesEqual(*a.a, *b.a) && traitTypesEqual(*a.b, *b.b);
+  case TypeKind::Inductive: {
+    if (a.inductive != b.inductive || a.typeArgs.size() != b.typeArgs.size())
+      return false;
+    for (size_t i = 0; i < a.typeArgs.size(); ++i)
+      if (!a.typeArgs[i] || !b.typeArgs[i] || !traitTypesEqual(*a.typeArgs[i], *b.typeArgs[i]))
+        return false;
+    return true;
+  }
+  default:
+    return normalizer_.typeEqual(a, b);
+  }
+}
+
+bool TypeChecker::patternEqual(const Type &a, const Type &b, const std::vector<const Symbol *> &bindersA,
+                               const std::vector<const Symbol *> &bindersB) {
+  const int ia = a.kind == TypeKind::TyVar ? binderSlot(a.tyVar, bindersA) : -1;
+  const int ib = b.kind == TypeKind::TyVar ? binderSlot(b.tyVar, bindersB) : -1;
+  if (ia >= 0 || ib >= 0)
+    return ia == ib;
+  if (a.kind != b.kind)
+    return false;
+  switch (a.kind) {
+  case TypeKind::Ref:
+    return a.refMut == b.refMut && a.elem && b.elem &&
+           patternEqual(*a.elem, *b.elem, bindersA, bindersB);
+  case TypeKind::Vector:
+  case TypeKind::Slice:
+    return a.elem && b.elem && patternEqual(*a.elem, *b.elem, bindersA, bindersB);
+  case TypeKind::Labeled:
+    return a.secrecy == b.secrecy && a.elem && b.elem &&
+           patternEqual(*a.elem, *b.elem, bindersA, bindersB);
+  case TypeKind::Struct: {
+    if (a.inductive != b.inductive || a.params.size() != b.params.size() ||
+        a.typeArgs.size() != b.typeArgs.size())
+      return false;
+    for (size_t i = 0; i < a.typeArgs.size(); ++i)
+      if (!a.typeArgs[i] || !b.typeArgs[i] ||
+          !patternEqual(*a.typeArgs[i], *b.typeArgs[i], bindersA, bindersB))
+        return false;
+    for (size_t i = 0; i < a.params.size(); ++i)
+      if (!a.params[i] || !b.params[i] ||
+          !patternEqual(*a.params[i], *b.params[i], bindersA, bindersB))
+        return false;
+    return true;
+  }
+  case TypeKind::Map:
+    return a.a && b.a && a.b && b.b && patternEqual(*a.a, *b.a, bindersA, bindersB) &&
+           patternEqual(*a.b, *b.b, bindersA, bindersB);
+  case TypeKind::TyVar:
+    return a.tyVar == b.tyVar;
+  default:
+    return normalizer_.typeEqual(a, b);
+  }
+}
+
+bool TypeChecker::bindPattern(const Type &pattern, const TypePtr &actual,
+                              const std::vector<const Symbol *> &binders,
+                              std::vector<TypePtr> &args) {
+  if (!actual)
+    return false;
+  if (pattern.kind == TypeKind::TyVar) {
+    const int slot = binderSlot(pattern.tyVar, binders);
+    if (slot >= 0) {
+      if (!args[static_cast<size_t>(slot)]) {
+        args[static_cast<size_t>(slot)] = actual;
+        return true;
+      }
+      return traitTypesEqual(*args[static_cast<size_t>(slot)], *actual);
+    }
+    return actual->kind == TypeKind::TyVar && actual->tyVar == pattern.tyVar;
+  }
+  if (pattern.kind != actual->kind)
+    return false;
+  switch (pattern.kind) {
+  case TypeKind::Ref:
+    return pattern.refMut == actual->refMut && pattern.elem &&
+           bindPattern(*pattern.elem, actual->elem, binders, args);
+  case TypeKind::Vector:
+  case TypeKind::Slice:
+  case TypeKind::Labeled:
+    return pattern.elem && bindPattern(*pattern.elem, actual->elem, binders, args);
+  case TypeKind::Struct: {
+    if (pattern.inductive != actual->inductive || pattern.params.size() != actual->params.size() ||
+        pattern.typeArgs.size() != actual->typeArgs.size())
+      return false;
+    for (size_t i = 0; i < pattern.typeArgs.size(); ++i)
+      if (!pattern.typeArgs[i] || !bindPattern(*pattern.typeArgs[i], actual->typeArgs[i], binders, args))
+        return false;
+    for (size_t i = 0; i < pattern.params.size(); ++i)
+      if (!pattern.params[i] || !bindPattern(*pattern.params[i], actual->params[i], binders, args))
+        return false;
+    return true;
+  }
+  case TypeKind::Map:
+    return pattern.a && pattern.b && bindPattern(*pattern.a, actual->a, binders, args) &&
+           bindPattern(*pattern.b, actual->b, binders, args);
+  case TypeKind::Inductive: {
+    if (pattern.inductive != actual->inductive || pattern.typeArgs.size() != actual->typeArgs.size())
+      return false;
+    for (size_t i = 0; i < pattern.typeArgs.size(); ++i)
+      if (!pattern.typeArgs[i] || !bindPattern(*pattern.typeArgs[i], actual->typeArgs[i], binders, args))
+        return false;
+    return true;
+  }
+  default:
+    return normalizer_.typeEqual(pattern, *actual);
+  }
+}
+
+bool TypeChecker::matchImpl(const ImplInfo &impl, const TypePtr &recv,
+                            std::vector<TypePtr> &args) {
+  if (!impl.target || !recv)
+    return false;
+  args.assign(impl.binders.size(), nullptr);
+  if (!bindPattern(*impl.target, recv, impl.binders, args))
+    return false;
+  for (const auto &arg : args)
+    if (!arg)
+      return false;
+  if (impl.binders.empty())
+    return true;
+  TypePtr inst = instantiateBinders(impl.target, impl.binders, args);
+  return inst && traitTypesEqual(*inst, *recv);
+}
+
+void TypeChecker::resolveTraits(File &file) {
+  for (auto &tr : file.traits) {
+    if (!tr->symbol)
+      continue;
+    pushScope();
+    Symbol selfSym;
+    selfSym.kind = SymbolKind::TypeParam;
+    selfSym.name = "Self";
+    selfSym.type = Type::universe(0);
+    selfSym.loc = tr->loc;
+    const Symbol *self = declareLocal(std::move(selfSym));
+    traitSelf_[tr->symbol] = self;
+    traitBinders_[tr->symbol] = openTypeBinders(tr->typeBinders);
+    std::vector<TraitMethod> methods;
+    for (auto &method : tr->methods) {
+      bool duplicate = false;
+      for (const auto &seen : methods)
+        if (seen.name == method->name)
+          duplicate = true;
+      if (duplicate) {
+        diags_.error(method->loc, "trait '" + tr->name + "' already declares '" + method->name + "'");
+        continue;
+      }
+      pushScope();
+      std::vector<TypePtr> params;
+      std::vector<const Symbol *> paramSyms;
+      std::vector<Usage> paramUses;
+      for (auto &p : method->params) {
+        if (!p.type) {
+          diags_.error(p.loc, "parameter '" + p.name + "' needs a type");
+          params.push_back(Type::error());
+          paramSyms.push_back(nullptr);
+          paramUses.push_back(Usage::Many);
+          continue;
+        }
+        TypePtr pt = resolveType(*p.type);
+        if (lookupLocal(p.name))
+          diags_.error(p.loc, "duplicate parameter name '" + p.name + "'");
+        Symbol ps;
+        ps.kind = SymbolKind::Param;
+        ps.name = p.name;
+        ps.type = pt;
+        ps.loc = p.loc;
+        paramSyms.push_back(declareLocal(std::move(ps)));
+        params.push_back(pt);
+        paramUses.push_back(Usage::Many);
+      }
+      TypePtr ret = method->ret ? resolveType(*method->ret) : Type::voidTy();
+      popScope();
+      if (params.empty() || !params[0] || !typeMentions(*params[0], self))
+        diags_.error(method->loc, "trait method '" + method->name +
+                                      "' must take a receiver whose type mentions Self");
+      TypePtr ty = Type::fn(std::move(params), paramSyms, ret, paramUses, method->effects, {},
+                            method->effectsDeclared);
+      if (tr->visibility == Visibility::Public && ty && !ty->isError())
+        ensureNotLeakingPrivate(*ty, method->loc, "public trait method '" + method->name + "'");
+      methods.push_back(TraitMethod{method->name, ty, method->loc});
+    }
+    popScope();
+    traitMethods_[tr->symbol] = std::move(methods);
+  }
+}
+
+void TypeChecker::resolveImpls(File &file) {
+  for (size_t i = 0; i < file.impls.size(); ++i) {
+    ImplDecl &decl = *file.impls[i];
+    Symbol *trait = resolveName(decl.traitPackage, decl.traitName, decl.loc);
+    if (!trait)
+      continue;
+    if (trait->kind != SymbolKind::Trait) {
+      diags_.error(decl.loc, "'" + trait->name + "' is not a trait");
+      continue;
+    }
+    pushScope();
+    std::vector<const Symbol *> binders = openTypeBinders(decl.binders);
+    TypePtr target = decl.target ? resolveType(*decl.target) : Type::error();
+    if (!target || target->isError()) {
+      popScope();
+      continue;
+    }
+    for (const Symbol *b : binders)
+      if (b && !typeMentions(*target, b))
+        diags_.error(decl.loc, "type binder '" + b->name + "' does not appear in the impl type");
+    currentSelf_ = target;
+    std::vector<TypePtr> supplied;
+    for (const auto &arg : decl.traitArgs)
+      supplied.push_back(arg ? resolveType(*arg) : Type::error());
+    for (auto &fn : file.functions) {
+      if (!fn || fn->implIndex != static_cast<int>(i) || !fn->symbol)
+        continue;
+      pushScope();
+      assignFunctionType(*fn, &binders);
+      popScope();
+      if (decl.visibility == Visibility::Public && fn->symbol->type)
+        ensureNotLeakingPrivate(*fn->symbol->type, fn->loc,
+                                "public impl method '" + fn->name + "'");
+    }
+    currentSelf_ = nullptr;
+    popScope();
+
+    ImplInfo info;
+    info.trait = trait;
+    info.target = target;
+    info.binders = binders;
+    info.visibility = decl.visibility;
+    info.package = package_;
+    info.loc = decl.loc;
+    const auto &required = traitMethods_[trait];
+    const Symbol *self = nullptr;
+    if (auto it = traitSelf_.find(trait); it != traitSelf_.end())
+      self = it->second;
+    for (auto &fn : file.functions) {
+      if (!fn || fn->implIndex != static_cast<int>(i) || !fn->symbol || !fn->symbol->type)
+        continue;
+      if (info.methods.count(fn->name)) {
+        diags_.error(fn->loc, "impl of '" + trait->name + "' already defines '" + fn->name + "'");
+        continue;
+      }
+      info.methods[fn->name] = fn->symbol;
+      const TraitMethod *tm = nullptr;
+      for (const auto &method : required)
+        if (method.name == fn->name)
+          tm = &method;
+      if (!tm) {
+        diags_.error(fn->loc, "method '" + fn->name + "' is not declared by trait '" + trait->name + "'");
+        continue;
+      }
+      TypePtr expected = self ? substTypeVar(tm->type, self, target) : tm->type;
+      const std::vector<const Symbol *> traitBinders = traitBinders_.count(trait)
+                                                            ? traitBinders_.find(trait)->second
+                                                            : std::vector<const Symbol *>{};
+      if (!traitBinders.empty() && expected) {
+        if (!binders.empty()) {
+          if (binders.size() != traitBinders.size())
+            diags_.error(decl.loc, "impl of '" + trait->name + "' expects " +
+                                       std::to_string(traitBinders.size()) + " type binder(s)");
+          else
+            for (size_t b = 0; b < traitBinders.size(); ++b)
+              expected = substTypeVar(expected, traitBinders[b], Type::typeVariable(binders[b]));
+        } else if (supplied.size() != traitBinders.size()) {
+          diags_.error(decl.loc, "impl of '" + trait->name + "' expects " +
+                                     std::to_string(traitBinders.size()) + " type argument(s), found " +
+                                     std::to_string(supplied.size()));
+        } else {
+          for (size_t b = 0; b < traitBinders.size(); ++b)
+            expected = substTypeVar(expected, traitBinders[b], supplied[b]);
+        }
+      } else if (!supplied.empty()) {
+        diags_.error(decl.loc, "trait '" + trait->name + "' does not take type arguments");
+      }
+      if (!expected || !traitTypesEqual(*expected, *fn->symbol->type))
+        diags_.error(fn->loc, "method '" + fn->name + "' of impl '" + trait->name +
+                                  "' does not match the trait");
+    }
+    for (const auto &method : required) {
+      if (!info.methods.count(method.name))
+        diags_.error(decl.loc, "impl of '" + trait->name + "' for '" + target->str() +
+                                   "' is missing method '" + method.name + "'");
+    }
+    for (const auto &prev : impls_) {
+      if (sameImplTarget(prev, info)) {
+        diags_.error(decl.loc, "duplicate impl of '" + trait->name + "' for '" + target->str() + "'");
+        diags_.note(prev.loc, "previous impl is here");
+      }
+    }
+    impls_.push_back(std::move(info));
+  }
+}
+
+TypeChecker::TraitLookup TypeChecker::lookupTrait(const std::string &name, const TypePtr &recv,
+                                                   const SourceLocation &loc, TraitDispatch &out) {
+  if (!recv)
+    return TraitLookup::None;
+  int hits = 0;
+  for (const auto &impl : impls_) {
+    if (impl.visibility != Visibility::Public && impl.package != package_)
+      continue;
+    auto it = impl.methods.find(name);
+    if (it == impl.methods.end() || !it->second || !it->second->type)
+      continue;
+    std::vector<TypePtr> args;
+    if (!matchImpl(impl, recv, args))
+      continue;
+    ++hits;
+    out.fn = it->second;
+    out.typeArgs = std::move(args);
+  }
+  if (hits == 0)
+    return TraitLookup::None;
+  if (hits > 1) {
+    fail(loc, "ambiguous trait method '" + name + "' for '" + recv->str() + "'");
+    return TraitLookup::Failed;
+  }
+  return TraitLookup::Found;
+}
+
+TypePtr TypeChecker::tryTraitMethod(ExprPtr &e, const TypePtr &recv, const Type *expected) {
+  auto &m = as<MethodCallExpr>(*e);
+  TraitDispatch hit;
+  const TraitLookup found = lookupTrait(m.method, recv, m.loc, hit);
+  if (found == TraitLookup::None)
+    return nullptr;
+  if (found == TraitLookup::Failed || !hit.fn || !hit.fn->type)
+    return Type::error();
+  auto callee = std::make_unique<IdentExpr>(m.loc, std::string{}, hit.fn->name);
+  callee->symbol = hit.fn;
+  callee->type = hit.fn->type;
+  std::vector<ExprPtr> args;
+  args.push_back(std::move(m.receiver));
+  for (auto &arg : m.args)
+    args.push_back(std::move(arg));
+  auto call = std::make_unique<CallExpr>(m.loc, std::move(callee), std::move(args));
+  call->fn = hit.fn;
+  call->typeArguments = std::move(hit.typeArgs);
+  e = std::move(call);
+  return checkFnCall(as<CallExpr>(*e), *hit.fn->type, expected);
+}
+
+bool TypeChecker::tryTraitFunction(CallExpr &call, const Type *expected, TypePtr &out) {
+  if (call.callee->kind != ExprKind::Ident || call.args.empty())
+    return false;
+  auto &callee = as<IdentExpr>(*call.callee);
+  if (!callee.package.empty())
+    return false;
+  bool saved = consume_;
+  consume_ = false;
+  TypePtr probed = checkExpr(call.args[0]);
+  consume_ = saved;
+  if (!probed || probed->isError()) {
+    out = Type::error();
+    return true;
+  }
+  TypePtr recv = probed;
+  if (recv->kind == TypeKind::Ref && recv->elem)
+    recv = recv->elem;
+  TraitDispatch hit;
+  const TraitLookup found = lookupTrait(callee.name, recv, call.loc, hit);
+  if (found == TraitLookup::None)
+    return false;
+  if (found == TraitLookup::Failed || !hit.fn || !hit.fn->type) {
+    out = Type::error();
+    return true;
+  }
+  callee.symbol = hit.fn;
+  callee.type = hit.fn->type;
+  call.fn = hit.fn;
+  call.typeArguments = std::move(hit.typeArgs);
+  out = checkFnCall(call, *hit.fn->type, expected);
+  return true;
+}
+
+bool TypeChecker::sameImplTarget(const ImplInfo &a, const ImplInfo &b) {
+  if (a.trait != b.trait || a.binders.size() != b.binders.size() || !a.target || !b.target)
+    return false;
+  return patternEqual(*a.target, *b.target, a.binders, b.binders);
 }
 
 TypePtr TypeChecker::resolveType(const TypeExpr &t) {
   switch (t.kind) {
+  case TypeExprKind::Ref: {
+    if (!t.elem)
+      return fail(t.loc, "reference type is missing its element");
+    TypePtr elem = resolveType(*t.elem);
+    if (elem->isError())
+      return elem;
+    if (elem->isErased())
+      return fail(t.loc, "cannot form a reference to erased type '" + elem->str() + "'");
+    return Type::refTy(std::move(elem), t.refMut, currentRegion_);
+  }
   case TypeExprKind::Named: {
+    if (t.package.empty() && t.name == "Self" && currentSelf_) {
+      if (!t.params.empty())
+        return fail(t.loc, "'Self' does not take type arguments");
+      return currentSelf_;
+    }
     if (t.package.empty()) {
+      if (t.name == "i8") return Type::i8();
+      if (t.name == "i16") return Type::i16();
       if (t.name == "i32") return Type::i32();
       if (t.name == "i64") return Type::i64();
+      if (t.name == "u8") return Type::u8();
+      if (t.name == "u16") return Type::u16();
+      if (t.name == "u32") return Type::u32();
+      if (t.name == "u64") return Type::u64();
+      if (t.name == "usize") return Type::usize();
+      if (t.name == "isize") return Type::isize();
       if (t.name == "f32") return Type::f32();
       if (t.name == "f64") return Type::f64();
       if (t.name == "bool") return Type::boolean();
@@ -617,6 +1212,21 @@ TypePtr TypeChecker::resolveType(const TypeExpr &t) {
         if (!t.params.empty())
           return fail(t.loc, "'Text' takes no type arguments");
         return Type::text();
+      }
+      if (t.name == "Simd") {
+        if (t.params.size() != 1 || !t.lhs)
+          return fail(t.loc, "'Simd' expects an element type and a lane count, as in Simd(i32, 4)");
+        TypePtr elem = resolveType(*t.params[0]);
+        if (elem->isError())
+          return elem;
+        if (!elem->isInteger() && !elem->isFloat())
+          return fail(t.loc, "Simd element must be an integer or a float, found '" + elem->str() + "'");
+        if (t.lhs->kind != ExprKind::IntLit)
+          return fail(t.lhs->loc, "Simd lane count must be 2, 4, 8, or 16");
+        const auto n = as<IntLitExpr>(*t.lhs).value;
+        if (n != 2 && n != 4 && n != 8 && n != 16)
+          return fail(t.lhs->loc, "Simd lane count must be 2, 4, 8, or 16");
+        return Type::simd(std::move(elem), static_cast<int>(n));
       }
       if (t.name == "Vec") {
         if (t.params.size() != 1 || !t.lhs)
@@ -708,7 +1318,30 @@ TypePtr TypeChecker::resolveType(const TypeExpr &t) {
       return Type::typeVariable(sym);
     if (sym->kind != SymbolKind::Type)
       return fail(t.loc, "'" + sym->qualifiedName() + "' is not a type");
-    return sym->type;
+    if (sym->typeBinders.empty()) {
+      if (!t.params.empty())
+        return fail(t.loc, "'" + sym->name + "' does not take type arguments");
+      return sym->type;
+    }
+    if (t.params.size() != sym->typeBinders.size())
+      return fail(t.loc, "'" + sym->name + "' expects " + std::to_string(sym->typeBinders.size()) +
+                             " type argument(s), found " + std::to_string(t.params.size()));
+    std::vector<TypePtr> args;
+    for (size_t i = 0; i < t.params.size(); ++i) {
+      TypePtr arg = resolveType(*t.params[i]);
+      if (arg->isError())
+        return arg;
+      int level = universeOf(*arg);
+      int bound = 0;
+      if (sym->type && i < sym->type->typeParamLevels.size())
+        bound = sym->type->typeParamLevels[i];
+      if (level > bound)
+        return fail(t.params[i]->loc, "type '" + arg->str() + "' lives in Type(" +
+                                           std::to_string(level) + "), above the binder Type(" +
+                                           std::to_string(bound) + ")");
+      args.push_back(std::move(arg));
+    }
+    return instantiateSymbol(*sym, args, currentRegion_);
   }
   case TypeExprKind::Path: {
     TypePtr elem = t.elem ? resolveType(*t.elem) : nullptr;
@@ -890,12 +1523,10 @@ void TypeChecker::checkGlobals() {
       if (g->symbol->type->isErased())
         continue; // proofs / type-level constants: no runtime representation
       ExprPtr nf = normalizer_.normalize(*g->init);
-      bool literal = nf->kind == ExprKind::IntLit || nf->kind == ExprKind::FloatLit ||
-                     nf->kind == ExprKind::BoolLit;
-      if (!literal)
+      if (!nf || !Normalizer::isValue(*nf))
         diags_.error(g->init->loc, "initializer of module-level '" + g->name +
                                        "' must be a compile-time constant (it normalises to '" +
-                                       toString(*nf) + "')");
+                                       (nf ? toString(*nf) : std::string("<nothing>")) + "')");
     }
   }
 }
@@ -904,6 +1535,18 @@ void TypeChecker::checkGlobals() {
 // Phase 5: function bodies
 // ---------------------------------------------------------------------------
 
+void TypeChecker::checkConstFunctions() {
+  for (auto &file : program_.files) {
+    if (file->package.empty())
+      continue;
+    file_ = file.get();
+    package_ = file->package;
+    for (auto &fn : file->functions)
+      if (fn->symbol && fn->isConstFn)
+        checkFunction(*fn);
+  }
+}
+
 void TypeChecker::checkFunctionBodies() {
   for (auto &file : program_.files) {
     if (file->package.empty())
@@ -911,7 +1554,7 @@ void TypeChecker::checkFunctionBodies() {
     file_ = file.get();
     package_ = file->package;
     for (auto &fn : file->functions)
-      if (fn->symbol && !fn->isExtern)
+      if (fn->symbol && !fn->isExtern && !fn->isConstFn)
         checkFunction(*fn);
   }
 }
@@ -939,8 +1582,9 @@ void TypeChecker::checkFunction(FnDecl &fn) {
   effectStack_.push_back(row);
 
   pushScope();
-  if (fnType.typeParam)
-    scopes_.back().names[fnType.typeParam->name] = const_cast<Symbol *>(fnType.typeParam);
+  for (const Symbol *binder : fnType.typeParams)
+    if (binder)
+      scopes_.back().names[binder->name] = const_cast<Symbol *>(binder);
   for (size_t i = 0; i < fn.params.size(); ++i)
     if (i < fnType.paramSymbols.size() && fnType.paramSymbols[i])
       scopes_.back().names[fn.params[i].name] = const_cast<Symbol *>(fnType.paramSymbols[i]);
@@ -965,6 +1609,306 @@ void TypeChecker::checkFunction(FnDecl &fn) {
   effectStack_.pop_back();
   currentFn_ = nullptr;
   currentRet_ = nullptr;
+  if (fn.name == "main" && fn.implIndex < 0 && !fn.isExtern)
+    checkMain(fn);
+  if (fn.isConstFn)
+    checkConstFn(fn);
+}
+
+void TypeChecker::checkMain(const FnDecl &fn) {
+  if (!fn.symbol || !fn.symbol->type || !fn.symbol->type->ret)
+    return;
+  const Type &ty = *fn.symbol->type;
+  const bool retOk = ty.ret->kind == TypeKind::I32;
+  const bool noArgs = ty.params.empty();
+  const bool cArgs = ty.params.size() == 2 && ty.params[0] && ty.params[0]->kind == TypeKind::I32 &&
+                     ty.params[1] && ty.params[1]->kind == TypeKind::Ptr;
+  if (!retOk || (!noArgs && !cArgs))
+    diags_.error(fn.loc, "main must be 'fn main(): i32' or 'fn main(argc: i32, argv: ptr): i32'");
+}
+
+void TypeChecker::checkForIterator(ForStmt &f) {
+  if (!f.iter || f.iter->kind != ExprKind::Ident) {
+    diags_.error(f.loc, "'for' over an iterator needs a local variable, as in 'for x in it'");
+    return;
+  }
+  bool saved = consume_;
+  consume_ = false;
+  TypePtr src = checkExpr(f.iter);
+  consume_ = saved;
+  if (!src || src->isError())
+    return;
+  const Symbol *sym = as<IdentExpr>(*f.iter).symbol;
+  if (!sym || sym->kind != SymbolKind::Local || sym->isConst) {
+    diags_.error(f.iter->loc, "'for' iterator must be a 'var'");
+    return;
+  }
+  TraitDispatch hit;
+  const TraitLookup found = lookupTrait("next", src, f.loc, hit);
+  if (found != TraitLookup::Found || !hit.fn || !hit.fn->type) {
+    diags_.error(f.loc, "no iterator method 'next' for '" + src->str() + "'");
+    return;
+  }
+  const Type &sig = *hit.fn->type;
+  if (sig.params.empty() || !sig.params[0] || sig.params[0]->kind != TypeKind::Ref ||
+      !sig.params[0]->refMut) {
+    diags_.error(f.loc, "iterator method 'next' must take '&mut Self'");
+    return;
+  }
+  auto callee = std::make_unique<IdentExpr>(f.loc, std::string{}, hit.fn->name);
+  callee->symbol = hit.fn;
+  callee->type = hit.fn->type;
+  std::vector<ExprPtr> args;
+  args.push_back(f.iter->clone());
+  auto call = std::make_unique<CallExpr>(f.loc, std::move(callee), std::move(args));
+  call->fn = hit.fn;
+  call->typeArguments = hit.typeArgs;
+  TypePtr ret = checkFnCall(*call, *hit.fn->type, nullptr);
+  call->type = ret;
+  f.step = std::move(call);
+  releaseStatementBorrows();
+  if (!ret || ret->isError())
+    return;
+  if (ret->kind != TypeKind::Inductive || !ret->inductive || ret->inductive->name != "Option" ||
+      ret->typeArgs.size() != 1 || !ret->typeArgs[0]) {
+    diags_.error(f.loc, "iterator method 'next' must return Option(T), found '" + ret->str() + "'");
+    return;
+  }
+  const Symbol *none = nullptr;
+  const Symbol *some = nullptr;
+  for (const Symbol *ctor : ret->inductive->ctors) {
+    if (!ctor)
+      continue;
+    if (ctor->name == "None")
+      none = ctor;
+    if (ctor->name == "Some")
+      some = ctor;
+  }
+  if (!none || !some) {
+    diags_.error(f.loc, "iterator method 'next' must return Option(T), found '" + ret->str() + "'");
+    return;
+  }
+  f.noneTag = none->ctorIndex;
+  f.someTag = some->ctorIndex;
+  f.someCtor = some;
+  Symbol bs;
+  bs.kind = SymbolKind::Local;
+  bs.name = f.name;
+  bs.type = ret->typeArgs[0];
+  bs.loc = f.loc;
+  bs.isConst = true;
+  pushScope();
+  f.binder = declareLocal(std::move(bs));
+  ++loopDepth_;
+  checkBlock(f.body);
+  --loopDepth_;
+  popScope();
+}
+
+void TypeChecker::checkFieldAssign(FieldAssignStmt &stmt) {
+  if (!stmt.place || !stmt.value)
+    return;
+  bool saved = consume_;
+  consume_ = false;
+  TypePtr placeTy = checkExpr(stmt.place);
+  consume_ = saved;
+  if (!placeTy || placeTy->isError())
+    return;
+  bool viaRef = false;
+  bool viaMut = false;
+  if (placeTy->kind == TypeKind::Ref && placeTy->elem) {
+    viaRef = true;
+    viaMut = placeTy->refMut;
+    placeTy = placeTy->elem;
+  }
+  if (placeTy->kind != TypeKind::Struct) {
+    diags_.error(stmt.loc, "field assignment needs a struct, found '" + placeTy->str() + "'");
+    return;
+  }
+  const Type *fieldTy = nullptr;
+  for (size_t i = 0; i < placeTy->params.size(); ++i) {
+    const Symbol *field = i < placeTy->paramSymbols.size() ? placeTy->paramSymbols[i] : nullptr;
+    if (!field || field->name != stmt.field)
+      continue;
+    fieldTy = placeTy->params[i].get();
+    break;
+  }
+  if (!fieldTy) {
+    diags_.error(stmt.loc, "struct has no field '" + stmt.field + "'");
+    return;
+  }
+  if (fieldTy->isStorage()) {
+    diags_.error(stmt.loc, "cannot assign owning field '" + stmt.field + "'");
+    return;
+  }
+  if (viaRef) {
+    if (!viaMut)
+      diags_.error(stmt.loc, "field assignment needs '&mut'");
+  } else if (stmt.place->kind == ExprKind::Ident) {
+    const Symbol *sym = as<IdentExpr>(*stmt.place).symbol;
+    if (!sym || (sym->kind != SymbolKind::Local && sym->kind != SymbolKind::Global))
+      diags_.error(stmt.loc, "field assignment updates a named variable");
+    else if (sym->isConst)
+      diags_.error(stmt.loc, "cannot assign to constant '" + sym->name + "'");
+    else
+      rejectIfBorrowed(sym, stmt.loc, true);
+  } else {
+    diags_.error(stmt.loc, "field assignment updates a named variable or '&mut'");
+  }
+  TypePtr vt = checkExpr(stmt.value, fieldTy);
+  if (vt && !vt->isError())
+    unify(*vt, *fieldTy, stmt.value->loc, "assignment to '" + stmt.field + "'");
+}
+
+bool TypeChecker::isConstType(const Type &type, std::set<const Symbol *> &seen) const {
+  if (type.isInteger() || type.isFloat() || type.kind == TypeKind::Bool)
+    return true;
+  if (type.kind != TypeKind::Struct || !type.inductive)
+    return false;
+  if (!seen.insert(type.inductive).second)
+    return false;
+  for (const auto &field : type.params) {
+    if (!field || !isConstType(*field, seen)) {
+      seen.erase(type.inductive);
+      return false;
+    }
+  }
+  seen.erase(type.inductive);
+  return true;
+}
+
+void TypeChecker::checkConstFn(const FnDecl &fn) {
+  if (!fn.typeBinders.empty())
+    diags_.error(fn.loc, "const fn '" + fn.name + "' cannot have a type binder");
+  if (fn.isExtern || fn.isCofn)
+    diags_.error(fn.loc, "const fn '" + fn.name + "' cannot be 'extern' or 'cofn'");
+  if ((fn.effectsDeclared && fn.effects != 0) || !fn.effectVar.empty())
+    diags_.error(fn.loc, "const fn '" + fn.name + "' cannot have an effect");
+  std::set<const Symbol *> seen;
+  if (fn.symbol && fn.symbol->type) {
+    const Type &ty = *fn.symbol->type;
+    if (!ty.ret || !isConstType(*ty.ret, seen))
+      diags_.error(fn.loc, "const fn '" + fn.name +
+                               "' must return a scalar or a fixed struct, found '" +
+                               (ty.ret ? ty.ret->str() : std::string("void")) + "'");
+    for (size_t i = 0; i < ty.params.size() && i < fn.params.size(); ++i) {
+      seen.clear();
+      if (ty.params[i] && !isConstType(*ty.params[i], seen))
+        diags_.error(fn.params[i].loc, "const fn parameter '" + fn.params[i].name +
+                                           "' must be a scalar or a fixed struct, found '" +
+                                           ty.params[i]->str() + "'");
+    }
+  }
+  checkConstBlock(fn.body);
+}
+
+void TypeChecker::checkConstBlock(const Block &block) {
+  for (const auto &stmt : block) {
+    if (!stmt)
+      continue;
+    switch (stmt->kind) {
+    case StmtKind::VarDecl: {
+      const auto &d = static_cast<const VarDeclStmt &>(*stmt);
+      if (!d.isConst)
+        diags_.error(d.loc, "const fn cannot declare 'var'");
+      else if (d.init)
+        checkConstExpr(*d.init);
+      break;
+    }
+    case StmtKind::Return: {
+      const auto &r = static_cast<const ReturnStmt &>(*stmt);
+      if (r.value)
+        checkConstExpr(*r.value);
+      break;
+    }
+    case StmtKind::If: {
+      const auto &i = static_cast<const IfStmt &>(*stmt);
+      if (i.cond)
+        checkConstExpr(*i.cond);
+      checkConstBlock(i.thenBody);
+      checkConstBlock(i.elseBody);
+      break;
+    }
+    default:
+      diags_.error(stmt->loc, "const fn body can only use 'const', 'if' and 'ret'");
+      break;
+    }
+  }
+}
+
+void TypeChecker::checkConstExpr(const Expr &e) {
+  switch (e.kind) {
+  case ExprKind::IntLit:
+  case ExprKind::FloatLit:
+  case ExprKind::BoolLit:
+    return;
+  case ExprKind::Unary: {
+    const auto &u = as<UnaryExpr>(e);
+    if (u.op == UnaryOp::IntervalRev)
+      diags_.error(e.loc, "const fn cannot use an interval");
+    if (u.operand)
+      checkConstExpr(*u.operand);
+    return;
+  }
+  case ExprKind::Binary: {
+    const auto &b = as<BinaryExpr>(e);
+    if (b.lhs)
+      checkConstExpr(*b.lhs);
+    if (b.rhs)
+      checkConstExpr(*b.rhs);
+    return;
+  }
+  case ExprKind::Cast: {
+    const auto &c = as<CastExpr>(e);
+    if (c.operand)
+      checkConstExpr(*c.operand);
+    if ((e.type && e.type->kind == TypeKind::Ptr) ||
+        (c.operand && c.operand->type && c.operand->type->kind == TypeKind::Ptr))
+      diags_.error(e.loc, "const fn cannot cast through 'ptr'");
+    return;
+  }
+  case ExprKind::Ident: {
+    const Symbol *sym = as<IdentExpr>(e).symbol;
+    if (!sym)
+      return;
+    if (sym->kind == SymbolKind::Local || sym->kind == SymbolKind::Param) {
+      if (sym->kind == SymbolKind::Local && !sym->isConst)
+        diags_.error(e.loc, "const fn cannot use 'var' '" + sym->name + "'");
+      return;
+    }
+    if (sym->kind == SymbolKind::Global && sym->isConst)
+      return;
+    diags_.error(e.loc, "const fn cannot use '" + sym->name + "' as a value");
+    return;
+  }
+  case ExprKind::Call: {
+    const auto &c = as<CallExpr>(e);
+    for (const auto &arg : c.args)
+      if (arg)
+        checkConstExpr(*arg);
+    if (c.fn && c.fn->kind == SymbolKind::Type && c.fn->type &&
+        c.fn->type->kind == TypeKind::Struct)
+      return;
+    if (c.fn && c.fn->fnDecl && c.fn->fnDecl->isConstFn)
+      return;
+    diags_.error(e.loc, "const fn can only call a const fn, found '" +
+                            (c.fn ? c.fn->name : std::string("?")) + "'");
+    return;
+  }
+  case ExprKind::Method: {
+    const auto &m = as<MethodCallExpr>(e);
+    if (m.invoked) {
+      diags_.error(e.loc, "const fn cannot call a method");
+      return;
+    }
+    if (m.receiver)
+      checkConstExpr(*m.receiver);
+    return;
+  }
+  default:
+    diags_.error(e.loc, "const fn cannot evaluate this expression");
+    return;
+  }
 }
 
 bool TypeChecker::blockAlwaysReturns(const Block &block) {
@@ -973,6 +1917,10 @@ bool TypeChecker::blockAlwaysReturns(const Block &block) {
       return true;
     if (s->kind == StmtKind::ScopeArena) {
       if (blockAlwaysReturns(static_cast<const ScopeArenaStmt &>(*s).body))
+        return true;
+    }
+    if (s->kind == StmtKind::Unsafe) {
+      if (blockAlwaysReturns(static_cast<const UnsafeStmt &>(*s).body))
         return true;
     }
     if (s->kind == StmtKind::If) {
@@ -1043,6 +1991,8 @@ void TypeChecker::checkStmt(Stmt &stmt) {
     s.usage = resolveUsage(d.usage, s.type ? *s.type : *Type::error(), s.shared, d.isConst);
     s.constInit = d.isConst ? d.init.get() : nullptr;
     d.symbol = declareLocal(std::move(s));
+    if (d.symbol && d.init)
+      bindLoan(*d.init, d.symbol);
     break;
   }
   case StmtKind::Assign: {
@@ -1071,6 +2021,7 @@ void TypeChecker::checkStmt(Stmt &stmt) {
       diags_.error(a.loc, "assignment drops linear binding '" + sym->name + "'");
     if (sym->usage != Usage::Many)
       moved_.erase(sym);
+    rejectIfBorrowed(sym, a.loc, true);
     break;
   }
   case StmtKind::Return: {
@@ -1087,6 +2038,21 @@ void TypeChecker::checkStmt(Stmt &stmt) {
       break;
     }
     TypePtr t = checkExpr(r.value, currentRet_.get());
+    auto localOwner = [](const Symbol *owner) {
+      return owner && (owner->kind == SymbolKind::Local || owner->kind == SymbolKind::Param);
+    };
+    if (r.value->kind == ExprKind::Borrow) {
+      const auto &b = as<BorrowExpr>(*r.value);
+      if (localOwner(b.owner))
+        diags_.error(r.loc, "cannot return a borrow of '" + b.owner->name + "'");
+    } else if (r.value->kind == ExprKind::Ident) {
+      const Symbol *sym = as<IdentExpr>(*r.value).symbol;
+      for (const auto &b : borrows_)
+        if (b.refBinding == sym && localOwner(b.owner))
+          diags_.error(r.loc, "cannot return '" + sym->name + "', it borrows '" + b.owner->name + "'");
+    } else if (localOwner(r.value->loanOwner)) {
+      diags_.error(r.loc, "cannot return a value that borrows '" + r.value->loanOwner->name + "'");
+    }
     if (!t->isError())
       unify(*t, *currentRet_, r.value->loc, "return value");
     exhaustInScope(r.loc);
@@ -1120,13 +2086,88 @@ void TypeChecker::checkStmt(Stmt &stmt) {
       diags_.error(w.cond->loc, "'while' condition must be 'bool', found '" + ct->str() + "'");
     auto saved = moved_;
     auto captured = symbolsInScope();
+    ++loopDepth_;
     checkBlock(w.body);
+    --loopDepth_;
     for (const Symbol *sym : moved_) {
       if (saved.count(sym) || !captured.count(sym) || sym->usage == Usage::Many)
         continue;
       diags_.error(w.loc, "owned binding '" + sym->name + "' cannot be consumed inside a loop");
     }
     moved_ = std::move(saved);
+    break;
+  }
+  case StmtKind::For: {
+    auto &f = static_cast<ForStmt &>(stmt);
+    if (f.iter) {
+      checkForIterator(f);
+      break;
+    }
+    TypePtr low = checkExpr(f.low, Type::i64().get());
+    TypePtr high = checkExpr(f.high, Type::i64().get());
+    if (!low->isError() && low->kind != TypeKind::I64)
+      diags_.error(f.low->loc, "'for' lower bound must be 'i64', found '" + low->str() + "'");
+    if (!high->isError() && high->kind != TypeKind::I64)
+      diags_.error(f.high->loc, "'for' upper bound must be 'i64', found '" + high->str() + "'");
+    Symbol bs;
+    bs.kind = SymbolKind::Local;
+    bs.name = f.name;
+    bs.type = Type::i64();
+    bs.loc = f.loc;
+    bs.isConst = true;
+    pushScope();
+    f.binder = declareLocal(std::move(bs));
+    ++loopDepth_;
+    checkBlock(f.body);
+    --loopDepth_;
+    popScope();
+    break;
+  }
+  case StmtKind::FieldAssign:
+    checkFieldAssign(static_cast<FieldAssignStmt &>(stmt));
+    break;
+  case StmtKind::Break:
+    if (loopDepth_ == 0)
+      diags_.error(stmt.loc, "'break' is outside a 'while' or 'for' loop");
+    break;
+  case StmtKind::Continue:
+    if (loopDepth_ == 0)
+      diags_.error(stmt.loc, "'continue' is outside a 'while' or 'for' loop");
+    break;
+  case StmtKind::IndexAssign: {
+    auto &ix = static_cast<IndexAssignStmt &>(stmt);
+    bool saved = consume_;
+    consume_ = false;
+    TypePtr place = checkExpr(ix.place);
+    consume_ = saved;
+    if (place->isError())
+      break;
+    TypePtr elem;
+    bool mutablePlace = false;
+    if (place->kind == TypeKind::Vector || place->kind == TypeKind::Slice) {
+      elem = place->elem;
+      mutablePlace = true;
+    } else if (place->kind == TypeKind::Ref && place->elem &&
+               (place->elem->kind == TypeKind::Vector || place->elem->kind == TypeKind::Slice)) {
+      elem = place->elem->elem;
+      mutablePlace = place->refMut;
+    }
+    if (!elem)
+      diags_.error(ix.loc, "index assignment requires a Vector or Slice");
+    else if (!mutablePlace && place->kind != TypeKind::Vector)
+      diags_.error(ix.loc, "index assignment needs a mutable place");
+    else if (place->kind == TypeKind::Vector && ix.place->kind != ExprKind::Ident)
+      diags_.error(ix.place->loc, "index assignment updates a named variable or an '&mut' place");
+    if (place->kind == TypeKind::Vector && ix.place->kind == ExprKind::Ident)
+      rejectIfBorrowed(as<IdentExpr>(*ix.place).symbol, ix.loc, true);
+    TypePtr idx = checkExpr(ix.index, Type::i64().get());
+    if (!idx->isError() && idx->kind != TypeKind::I64)
+      diags_.error(ix.index->loc, "index must be 'i64', found '" + idx->str() + "'");
+    if (elem) {
+      TypePtr vt = checkExpr(ix.value, elem.get());
+      if (!vt->isError())
+        unify(*vt, *elem, ix.value->loc, "index assignment");
+    }
     break;
   }
   case StmtKind::Foreach: {
@@ -1155,6 +2196,13 @@ void TypeChecker::checkStmt(Stmt &stmt) {
     popRegion();
     break;
   }
+  case StmtKind::Unsafe: {
+    auto &u = static_cast<UnsafeStmt &>(stmt);
+    ++unsafeDepth_;
+    checkBlock(u.body);
+    --unsafeDepth_;
+    break;
+  }
   case StmtKind::Expr: {
     auto &e = static_cast<ExprStmt &>(stmt);
     TypePtr t = checkExpr(e.expr);
@@ -1166,6 +2214,7 @@ void TypeChecker::checkStmt(Stmt &stmt) {
   case StmtKind::Error:
     break;
   }
+  releaseStatementBorrows();
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,9 +2313,44 @@ TypePtr TypeChecker::checkExpr(ExprPtr &e, const Type *expected) {
       t = expected->kind == TypeKind::F32 ? Type::f32() : Type::f64();
       break;
     }
-    t = expected && expected->kind == TypeKind::I64 ? Type::i64() : Type::i32();
-    if (t->kind == TypeKind::I32 && (lit.value > INT32_MAX || lit.value < INT32_MIN))
+    auto fits = [&](TypeKind k) {
+      const std::int64_t v = lit.value;
+      switch (k) {
+      case TypeKind::I8: return v >= -128 && v <= 127;
+      case TypeKind::U8: return v >= 0 && v <= 255;
+      case TypeKind::I16: return v >= -32768 && v <= 32767;
+      case TypeKind::U16: return v >= 0 && v <= 65535;
+      case TypeKind::I32: return v >= INT32_MIN && v <= INT32_MAX;
+      case TypeKind::U32: return v >= 0 && v <= static_cast<std::int64_t>(UINT32_MAX);
+      case TypeKind::I64: return true;
+      case TypeKind::U64: return v >= 0;
+      case TypeKind::USize:
+        return Type::pointerBits() >= 64
+                   ? v >= 0
+                   : v >= 0 && v <= static_cast<std::int64_t>(UINT32_MAX);
+      case TypeKind::ISize:
+        return Type::pointerBits() >= 64 || (v >= INT32_MIN && v <= INT32_MAX);
+      default: return false;
+      }
+    };
+    TypeKind chosen = TypeKind::I32;
+    if (expected && expected->isInteger() && fits(expected->kind))
+      chosen = expected->kind;
+    else if (!fits(TypeKind::I32))
       return fail(e->loc, "integer literal " + std::to_string(lit.value) + " does not fit in i32");
+    switch (chosen) {
+    case TypeKind::I8: t = Type::i8(); break;
+    case TypeKind::I16: t = Type::i16(); break;
+    case TypeKind::I32: t = Type::i32(); break;
+    case TypeKind::I64: t = Type::i64(); break;
+    case TypeKind::U8: t = Type::u8(); break;
+    case TypeKind::U16: t = Type::u16(); break;
+    case TypeKind::U32: t = Type::u32(); break;
+    case TypeKind::U64: t = Type::u64(); break;
+    case TypeKind::USize: t = Type::usize(); break;
+    case TypeKind::ISize: t = Type::isize(); break;
+    default: t = Type::i32(); break;
+    }
     break;
   }
   case ExprKind::FloatLit:
@@ -1320,6 +2404,15 @@ TypePtr TypeChecker::checkExpr(ExprPtr &e, const Type *expected) {
   case ExprKind::Method:
     t = checkMethod(e, expected);
     break;
+  case ExprKind::Cast:
+    t = checkCast(as<CastExpr>(*e));
+    break;
+  case ExprKind::Borrow:
+    t = checkBorrow(as<BorrowExpr>(*e));
+    break;
+  case ExprKind::Try:
+    t = checkTry(as<TryExpr>(*e));
+    break;
   }
   if (!t)
     t = Type::error();
@@ -1328,6 +2421,8 @@ TypePtr TypeChecker::checkExpr(ExprPtr &e, const Type *expected) {
     e->flow = Usage::Linear;
   else if (e->flow == Usage::Many && t->isStorage())
     e->flow = Usage::Affine;
+  if (!t->isError() && t->kind == TypeKind::Ptr)
+    requireUnsafe(e->loc, "a raw 'ptr' operation");
   return t;
 }
 
@@ -1344,6 +2439,14 @@ TypePtr TypeChecker::checkIdent(ExprPtr &e, const Type *expected) {
   case SymbolKind::IntervalVar:
   case SymbolKind::PatternVar:
     noteUse(sym, id.loc);
+    if (!inBorrowPlace_ && !consume_)
+      rejectIfBorrowed(sym, id.loc, false);
+    for (const auto &b : borrows_) {
+      if (b.refBinding == sym && b.owner) {
+        e->loanOwner = b.owner;
+        break;
+      }
+    }
     id.flow = sym->usage;
     return sym->type ? sym->type : Type::error();
   case SymbolKind::Axiom:
@@ -1361,9 +2464,24 @@ TypePtr TypeChecker::checkIdent(ExprPtr &e, const Type *expected) {
     e = std::move(lit);
     return typeOfDenoted(*sym->type);
   }
+  case SymbolKind::Trait:
+    return fail(id.loc, "trait '" + sym->name + "' is not a value");
   case SymbolKind::Ctor: {
     if (!sym->type || sym->type->isError())
       return Type::error();
+    if (sym->owner && !sym->owner->typeBinders.empty()) {
+      if (!expected || expected->kind != TypeKind::Inductive || expected->inductive != sym->owner ||
+          expected->typeArgs.size() != sym->owner->typeBinders.size())
+        return fail(id.loc, "generic constructor '" + sym->name +
+                                "' needs an expected type, as in 'var x: Option(i32) = None'");
+      if (sym->type->kind == TypeKind::Fn)
+        return fail(id.loc, "constructor '" + sym->name + "' expects " +
+                                std::to_string(sym->type->params.size()) + " argument(s)");
+      auto call = std::make_unique<CallExpr>(id.loc, std::move(e), std::vector<ExprPtr>{});
+      call->fn = sym;
+      e = std::move(call);
+      return instantiateSymbol(*sym->owner, expected->typeArgs, expected->region);
+    }
     if (sym->type->kind == TypeKind::Fn)
       return fail(id.loc, "constructor '" + sym->name + "' expects " +
                               std::to_string(sym->type->params.size()) +
@@ -1424,6 +2542,24 @@ TypePtr TypeChecker::checkBinary(BinaryExpr &b, const Type *expected) {
       return Type::error();
     return Type::boolean();
   }
+  case BinaryOp::BitAnd:
+  case BinaryOp::BitOr:
+  case BinaryOp::BitXor:
+  case BinaryOp::Shl:
+  case BinaryOp::Shr: {
+    TypePtr lt = checkExpr(b.lhs);
+    if (lt->isError())
+      return lt;
+    TypePtr rt = checkExpr(b.rhs, lt.get());
+    if (rt->isError())
+      return rt;
+    if (!lt->isInteger() || !rt->isInteger())
+      return fail(b.loc, std::string("operator '") + binaryOpSpelling(b.op) +
+                             "' requires integer operands, found '" + lt->str() + "'");
+    if (!unify(*rt, *lt, b.rhs->loc, std::string("operands of '") + binaryOpSpelling(b.op) + "'"))
+      return Type::error();
+    return lt;
+  }
   case BinaryOp::And:
   case BinaryOp::Or: {
     TypePtr lt = checkExpr(b.lhs, Type::boolean().get());
@@ -1469,12 +2605,14 @@ TypePtr TypeChecker::checkUnary(UnaryExpr &u, const Type *expected) {
     return t;
   }
   case UnaryOp::IntervalRev: {
-    TypePtr t = checkExpr(u.operand, Type::interval().get());
+    TypePtr t = checkExpr(u.operand, expected && (expected->isInteger() || expected->kind == TypeKind::Interval)
+                                          ? expected
+                                          : nullptr);
     if (t->isError())
       return t;
-    if (t->kind != TypeKind::Interval)
-      return fail(u.loc, "'~' requires an interval operand, found '" + t->str() + "'");
-    return t;
+    if (t->isInteger() || t->kind == TypeKind::Interval)
+      return t;
+    return fail(u.loc, "'~' requires an integer or interval operand, found '" + t->str() + "'");
   }
   }
   return Type::error();
@@ -1493,12 +2631,25 @@ TypePtr TypeChecker::checkCall(ExprPtr &e, const Type *expected) {
         return checkBuiltinCall(call, bi->second, expected);
       }
     }
-    Symbol *sym = resolveName(callee.package, callee.name, callee.loc);
-    if (!sym)
+    Symbol *sym = resolveName(callee.package, callee.name, callee.loc, false);
+    if (!sym) {
+      TypePtr dispatched;
+      if (tryTraitFunction(call, expected, dispatched))
+        return dispatched;
+      resolveName(callee.package, callee.name, callee.loc, true);
       return Type::error();
+    }
     callee.symbol = sym;
     if (sym->kind == SymbolKind::Type && sym->type && sym->type->kind == TypeKind::Struct) {
       call.fn = sym;
+      if (!sym->typeBinders.empty()) {
+        if (!expected || expected->kind != TypeKind::Struct || expected->inductive != sym ||
+            expected->typeArgs.size() != sym->typeBinders.size())
+          return fail(call.loc, "generic struct '" + sym->name +
+                                    "' needs an expected type, as in 'var p: Pair(i32, i64) = ...'");
+        callee.type = sym->type;
+        return checkStructCall(call, *expected);
+      }
       callee.type = sym->type;
       return checkStructCall(call, *sym->type);
     }
@@ -1506,13 +2657,27 @@ TypePtr TypeChecker::checkCall(ExprPtr &e, const Type *expected) {
       if (!sym->type || sym->type->isError())
         return Type::error();
       call.fn = sym;
+      if (sym->kind == SymbolKind::Ctor && sym->owner && !sym->owner->typeBinders.empty()) {
+        if (!expected || expected->kind != TypeKind::Inductive || expected->inductive != sym->owner ||
+            expected->typeArgs.size() != sym->owner->typeBinders.size())
+          return fail(call.loc, "generic constructor '" + sym->name +
+                                    "' needs an expected type, as in 'var x: Option(i32) = None()'");
+        TypePtr ctorTy = instantiateBinders(sym->type, sym->owner->typeBinders, expected->typeArgs);
+        TypePtr got = checkFnCall(call, *ctorTy, expected);
+        if (got->isError())
+          return got;
+        return instantiateSymbol(*sym->owner, expected->typeArgs, expected->region);
+      }
       if (sym->type->kind != TypeKind::Fn) {
         if (sym->kind == SymbolKind::Ctor)
           return fail(call.loc, "constructor '" + sym->name + "' takes no arguments");
         return Type::error();
       }
       callee.type = sym->type;
-      return checkFnCall(call, *sym->type, expected);
+      TypePtr got = checkFnCall(call, *sym->type, expected);
+      if (sym->package == "thread" && sym->name == "spawn")
+        noteSpawnShared(call);
+      return got;
     }
   }
 
@@ -1528,24 +2693,63 @@ TypePtr TypeChecker::checkFnCall(CallExpr &call, const Type &fnType, const Type 
   (void)expected;
   TypePtr instantiated;
   const Type *use = &fnType;
-  if (fnType.typeParam) {
-    if (!call.hasTypeArg || !call.typeArg)
-      return fail(call.loc, "function '" + fnType.typeParam->name +
-                                "' must be instantiated, as in name[i32](...)");
-    TypePtr argTy = resolveType(*call.typeArg);
-    if (argTy->isError())
-      return argTy;
-    int level = universeOf(*argTy);
-    if (level > fnType.typeParamLevel) {
-      diags_.error(call.typeArg->loc, "type '" + argTy->str() + "' lives in Type(" +
-                                           std::to_string(level) + "), above the binder Type(" +
-                                           std::to_string(fnType.typeParamLevel) + ")");
-      return Type::error();
+  if (!fnType.typeParams.empty()) {
+    std::vector<TypePtr> args;
+    if (call.typeArguments.size() == fnType.typeParams.size()) {
+      args = call.typeArguments;
+    } else if (call.hasTypeArg) {
+      if (call.typeArgs.size() != fnType.typeParams.size())
+        return fail(call.loc, "expected " + std::to_string(fnType.typeParams.size()) +
+                                  " type argument(s), found " + std::to_string(call.typeArgs.size()));
+      for (size_t i = 0; i < call.typeArgs.size(); ++i) {
+        TypePtr argTy = resolveType(*call.typeArgs[i]);
+        if (argTy->isError())
+          return argTy;
+        int level = universeOf(*argTy);
+        int bound = i < fnType.typeParamLevels.size() ? fnType.typeParamLevels[i] : 0;
+        if (level > bound) {
+          diags_.error(call.typeArgs[i]->loc, "type '" + argTy->str() + "' lives in Type(" +
+                                                   std::to_string(level) + "), above the binder Type(" +
+                                                   std::to_string(bound) + ")");
+          return Type::error();
+        }
+        args.push_back(std::move(argTy));
+      }
+    } else if (fnType.typeParams.size() == 1) {
+      const Symbol *var = fnType.typeParams[0];
+      bool saved = consume_;
+      consume_ = false;
+      TypePtr solved;
+      for (size_t i = 0; i < call.args.size() && i < fnType.params.size(); ++i) {
+        TypePtr at = checkExpr(call.args[i]);
+        if (at->isError()) {
+          consume_ = saved;
+          return at;
+        }
+        if (TypePtr got = inferTypeArg(*fnType.params[i], at, var)) {
+          if (solved && !normalizer_.typeEqual(*solved, *got)) {
+            consume_ = saved;
+            return fail(call.loc, "type argument '" + var->name +
+                                      "' is not determined; write an explicit instantiation");
+          }
+          solved = got;
+        }
+      }
+      consume_ = saved;
+      if (!solved)
+        return fail(call.loc, "function '" + var->name +
+                                  "' must be instantiated, as in name[i32](...)");
+      args.push_back(solved);
+    } else {
+      return fail(call.loc, "function must be instantiated, as in name[i32, i64](...)");
     }
-    call.typeArgument = argTy;
-    instantiated = substTypeVar(Type::fn(fnType.params, fnType.paramSymbols, fnType.ret, fnType.paramUse,
-                                         fnType.effects, fnType.effectVar, fnType.effectsDeclared),
-                                fnType.typeParam, argTy);
+    call.typeArguments = args;
+    if (!args.empty())
+      call.typeArgument = args.front();
+    instantiated = Type::fn(fnType.params, fnType.paramSymbols, fnType.ret, fnType.paramUse,
+                            fnType.effects, fnType.effectVar, fnType.effectsDeclared, nullptr, -1,
+                            fnType.varArg);
+    instantiated = instantiateBinders(instantiated, fnType.typeParams, args);
     use = instantiated.get();
   } else if (call.hasTypeArg) {
     return fail(call.loc, "type instantiation requires a binder, as in 'fn id[T: Type(0)](...)'");
@@ -1558,10 +2762,16 @@ TypePtr TypeChecker::checkFnCall(CallExpr &call, const Type &fnType, const Type 
     instantiated = instantiateEffects(instantiated, fnType.effectVar, call.effectInst);
     use = instantiated.get();
   }
-  if (call.args.size() != use->params.size())
+  if (use->varArg) {
+    if (call.args.size() < use->params.size())
+      return fail(call.loc, "wrong number of arguments: expected at least " +
+                                std::to_string(use->params.size()) + ", found " +
+                                std::to_string(call.args.size()));
+  } else if (call.args.size() != use->params.size()) {
     return fail(call.loc, "wrong number of arguments: expected " +
                               std::to_string(use->params.size()) + ", found " +
                               std::to_string(call.args.size()));
+  }
   // Dependent application: later parameter types and the return type may
   // mention earlier parameters, so substitute as we go.
   std::vector<TypePtr> paramTypes = use->params;
@@ -1570,14 +2780,31 @@ TypePtr TypeChecker::checkFnCall(CallExpr &call, const Type &fnType, const Type 
                   (use->effectsDeclared && (use->effects & effectIo) != 0);
   bool ok = true;
   for (size_t i = 0; i < call.args.size(); ++i) {
-    TypePtr at = checkExpr(call.args[i], paramTypes[i].get());
+    const bool extra = i >= paramTypes.size();
+    const Type *hint = extra ? nullptr : paramTypes[i].get();
+    if (!extra && hint && hint->kind == TypeKind::Ref && call.args[i]->kind != ExprKind::Borrow) {
+      bool saved = consume_;
+      consume_ = false;
+      TypePtr probed = checkExpr(call.args[i]);
+      consume_ = saved;
+      if (!probed->isError() && probed->kind != TypeKind::Ref && hint->elem &&
+          normalizer_.typeEqual(*probed, *hint->elem)) {
+        auto borrowed = std::make_unique<BorrowExpr>(call.args[i]->loc, hint->refMut,
+                                                     std::move(call.args[i]));
+        call.args[i] = std::move(borrowed);
+      }
+    }
+    TypePtr at = checkExpr(call.args[i], hint);
     if (at->isError()) {
       ok = false;
       continue;
     }
-    if (!unify(*at, *paramTypes[i], call.args[i]->loc, "argument " + std::to_string(i + 1)))
+    if (extra) {
+      if (!at->isCCompatible() || at->isStorage() || at->kind == TypeKind::Slice)
+        return fail(call.args[i]->loc, "vararg argument must be a C scalar, found '" + at->str() + "'");
+    } else if (!unify(*at, *paramTypes[i], call.args[i]->loc, "argument " + std::to_string(i + 1))) {
       ok = false;
-    else if (boundary)
+    } else if (boundary)
       rejectBoundary(*call.args[i], true, call.args[i]->loc, "extern or io boundary");
     if (i < use->paramSymbols.size()) {
       if (const Symbol *ps = use->paramSymbols[i]) {
@@ -1618,7 +2845,7 @@ TypePtr TypeChecker::checkBuiltinCall(CallExpr &call, Builtin builtin, const Typ
     io.effectsDeclared = true;
     noteEffect(io, nullptr, call.loc);
     if (!t->isNumeric() && t->kind != TypeKind::Bool)
-      return fail(call.loc, "'print' supports i32, i64, f32, f64 and bool, found '" + t->str() + "'");
+      return fail(call.loc, "'print' supports integers, floats and bool, found '" + t->str() + "'");
     return Type::voidTy();
   }
   case Builtin::Refl: {
@@ -1798,6 +3025,187 @@ TypePtr TypeChecker::checkBuiltinCall(CallExpr &call, Builtin builtin, const Typ
     return Type::quotient(expected->elem, expected->lhs ? expected->lhs->clone() : nullptr,
                           expected->rhs ? expected->rhs->clone() : nullptr, expected->canonFn);
   }
+  case Builtin::Assert: {
+    if (!arity(1, "assert"))
+      return Type::error();
+    TypePtr c = checkExpr(call.args[0], Type::boolean().get());
+    if (c->isError())
+      return c;
+    if (c->kind != TypeKind::Bool)
+      return fail(call.args[0]->loc, "'assert' expects 'bool', found '" + c->str() + "'");
+    return Type::voidTy();
+  }
+  case Builtin::Trap: {
+    if (!arity(1, "trap"))
+      return Type::error();
+    TypePtr m = checkExpr(call.args[0]);
+    if (m->isError())
+      return m;
+    if (call.args[0]->kind != ExprKind::StringLit)
+      return fail(call.args[0]->loc, "'trap' expects a string literal");
+    return Type::voidTy();
+  }
+  case Builtin::CmpXchg:
+  case Builtin::AtomicRmw:
+  case Builtin::AtomicLoad:
+  case Builtin::AtomicStore: {
+    const char *name = builtin == Builtin::CmpXchg     ? "cmpxchg"
+                       : builtin == Builtin::AtomicRmw  ? "atomicrmw"
+                       : builtin == Builtin::AtomicLoad ? "atomic_load"
+                                                        : "atomic_store";
+    // cmpxchg(&p, expected, desired, success, failure)
+    // atomicrmw(op, &p, value, order)
+    // atomic_load(&p, order)
+    // atomic_store(&p, value, order)
+    const size_t expectN = builtin == Builtin::CmpXchg     ? 5
+                           : builtin == Builtin::AtomicRmw  ? 4
+                           : builtin == Builtin::AtomicLoad ? 2
+                                                            : 3;
+    if (!arity(expectN, name))
+      return Type::error();
+    requireUnsafe(call.loc, name);
+    const size_t placeAt = builtin == Builtin::AtomicRmw ? 1 : 0;
+    const size_t orderAt = call.args.size() - 1;
+    TypePtr placeTy = checkExpr(call.args[placeAt]);
+    if (!placeTy || placeTy->isError())
+      return Type::error();
+    const Type *elem = placeTy->kind == TypeKind::Ref ? placeTy->elem.get() : nullptr;
+    if (!elem || !atomicWidth(*elem))
+      return fail(call.args[placeAt]->loc,
+                  "atomic operation needs a reference to an 8, 16, 32, or 64 bit integer");
+    auto takeOrder = [&](size_t index, const char *what) -> std::string {
+      TypePtr ot = checkExpr(call.args[index]);
+      if (!ot || ot->isError())
+        return {};
+      const Symbol *ctor = nullaryCtor(*call.args[index]);
+      if (!ctor || ctor->owner->name != "Order" || orderRank(ctor->name) == 0) {
+        fail(call.args[index]->loc,
+             std::string(what) + " must be an Order constructor, as in SeqCst");
+        return {};
+      }
+      return ctor->name;
+    };
+    if (builtin == Builtin::AtomicRmw) {
+      TypePtr opTy = checkExpr(call.args[0]);
+      if (!opTy || opTy->isError())
+        return Type::error();
+      const Symbol *op = nullaryCtor(*call.args[0]);
+      if (!op || op->owner->name != "Rmw" ||
+          (op->name != "Xchg" && op->name != "Add" && op->name != "Sub" && op->name != "And" &&
+           op->name != "Or" && op->name != "Xor"))
+        return fail(call.args[0]->loc, "rmw operation must be an Rmw constructor, as in Add");
+      TypePtr val = checkExpr(call.args[2], elem);
+      if (!val || val->isError())
+        return Type::error();
+      if (!unify(*val, *elem, call.args[2]->loc, "atomicrmw value"))
+        return Type::error();
+    } else if (builtin == Builtin::CmpXchg) {
+      TypePtr expectedV = checkExpr(call.args[1], elem);
+      TypePtr desired = checkExpr(call.args[2], elem);
+      if (!expectedV || expectedV->isError() || !desired || desired->isError())
+        return Type::error();
+      if (!unify(*expectedV, *elem, call.args[1]->loc, "cmpxchg expected") ||
+          !unify(*desired, *elem, call.args[2]->loc, "cmpxchg desired"))
+        return Type::error();
+      std::string success = takeOrder(3, "cmpxchg success order");
+      std::string failure = takeOrder(4, "cmpxchg failure order");
+      if (success.empty() || failure.empty())
+        return Type::error();
+      if (failure == "Release" || failure == "AcqRel" || orderRank(failure) > orderRank(success))
+        return fail(call.args[4]->loc,
+                    "cmpxchg failure order cannot be Release, AcqRel, or stronger than the success order");
+      return Type::boolean();
+    } else if (builtin == Builtin::AtomicStore) {
+      TypePtr val = checkExpr(call.args[1], elem);
+      if (!val || val->isError())
+        return Type::error();
+      if (!unify(*val, *elem, call.args[1]->loc, "atomic_store value"))
+        return Type::error();
+    }
+    std::string order = takeOrder(orderAt, name);
+    if (order.empty())
+      return Type::error();
+    if (builtin == Builtin::AtomicLoad && order != "Relaxed" && order != "Acquire" && order != "SeqCst")
+      return fail(call.args[orderAt]->loc, "atomic_load order must be Relaxed, Acquire, or SeqCst");
+    if (builtin == Builtin::AtomicStore && order != "Relaxed" && order != "Release" && order != "SeqCst")
+      return fail(call.args[orderAt]->loc, "atomic_store order must be Relaxed, Release, or SeqCst");
+    if (builtin == Builtin::AtomicRmw && orderRank(order) == 0)
+      return Type::error();
+    if (builtin == Builtin::AtomicStore)
+      return Type::voidTy();
+    return elem->kind == TypeKind::I8    ? Type::i8()
+           : elem->kind == TypeKind::I16 ? Type::i16()
+           : elem->kind == TypeKind::I32 ? Type::i32()
+           : elem->kind == TypeKind::I64 ? Type::i64()
+           : elem->kind == TypeKind::U8  ? Type::u8()
+           : elem->kind == TypeKind::U16 ? Type::u16()
+           : elem->kind == TypeKind::U32 ? Type::u32()
+           : elem->kind == TypeKind::U64 ? Type::u64()
+           : elem->kind == TypeKind::USize ? Type::usize()
+                                         : Type::isize();
+  }
+  case Builtin::Simd: {
+    requireUnsafe(call.loc, "simd");
+    if (!expected || expected->kind != TypeKind::Simd || !expected->elem)
+      return fail(call.loc, "'simd' needs an expected type, as in 'var v: Simd(i32, 4) = simd(1, 2, 3, 4)'");
+    if (call.args.size() != static_cast<size_t>(expected->lanes))
+      return fail(call.loc, "'simd' expects " + std::to_string(expected->lanes) + " lane(s), found " +
+                                std::to_string(call.args.size()));
+    for (auto &arg : call.args) {
+      TypePtr at = checkExpr(arg, expected->elem.get());
+      if (!at || at->isError())
+        return Type::error();
+      if (!unify(*at, *expected->elem, arg->loc, "simd lane"))
+        return Type::error();
+    }
+    return Type::simd(expected->elem, expected->lanes);
+  }
+  case Builtin::SimdAdd: {
+    requireUnsafe(call.loc, "simd_add");
+    if (!arity(2, "simd_add"))
+      return Type::error();
+    TypePtr lhs = checkExpr(call.args[0]);
+    if (!lhs || lhs->isError())
+      return Type::error();
+    if (lhs->kind != TypeKind::Simd || !lhs->elem)
+      return fail(call.args[0]->loc, "'simd_add' expects a Simd value, found '" + lhs->str() + "'");
+    TypePtr rhs = checkExpr(call.args[1], lhs.get());
+    if (!rhs || rhs->isError())
+      return Type::error();
+    if (!unify(*rhs, *lhs, call.args[1]->loc, "simd_add"))
+      return Type::error();
+    return Type::simd(lhs->elem, lhs->lanes);
+  }
+  case Builtin::SimdExtract: {
+    requireUnsafe(call.loc, "simd_extract");
+    if (!arity(2, "simd_extract"))
+      return Type::error();
+    TypePtr vec = checkExpr(call.args[0]);
+    if (!vec || vec->isError())
+      return Type::error();
+    if (vec->kind != TypeKind::Simd || !vec->elem)
+      return fail(call.args[0]->loc, "'simd_extract' expects a Simd value, found '" + vec->str() + "'");
+    TypePtr idx = checkExpr(call.args[1], Type::i32().get());
+    if (!idx || idx->isError())
+      return Type::error();
+    if (call.args[1]->kind != ExprKind::IntLit)
+      return fail(call.args[1]->loc, "simd_extract index must be a constant");
+    const auto lane = as<IntLitExpr>(*call.args[1]).value;
+    if (lane < 0 || lane >= vec->lanes)
+      return fail(call.args[1]->loc, "simd_extract index is outside the vector");
+    return vec->elem;
+  }
+  case Builtin::Asm: {
+    requireUnsafe(call.loc, "asm");
+    if (!arity(1, "asm"))
+      return Type::error();
+    TypePtr m = checkExpr(call.args[0]);
+    if (!m || m->isError())
+      return Type::error();
+    if (call.args[0]->kind != ExprKind::StringLit)
+      return fail(call.args[0]->loc, "'asm' expects a string literal");
+    return Type::voidTy();
+  }
   case Builtin::Text: {
     if (!arity(1, "text"))
       return Type::error();
@@ -1811,6 +3219,7 @@ TypePtr TypeChecker::checkBuiltinCall(CallExpr &call, Builtin builtin, const Typ
   case Builtin::RawSlice: {
     if (!arity(2, "raw_slice"))
       return Type::error();
+    requireUnsafe(call.loc, "integer-to-pointer conversion 'raw_slice'");
     TypePtr addr = checkExpr(call.args[0], Type::i64().get());
     TypePtr len = checkExpr(call.args[1], Type::i64().get());
     if (addr->isError() || len->isError())
@@ -2082,6 +3491,8 @@ TypePtr TypeChecker::checkMatch(MatchExpr &m, const Type *expected) {
       ps.kind = SymbolKind::PatternVar;
       ps.name = c.binders[i];
       ps.type = ctor->type->params[i];
+      if (ps.type && !st->typeArgs.empty())
+        ps.type = instantiateBinders(ps.type, typeSym.typeBinders, st->typeArgs);
       ps.loc = c.loc;
       c.binderSymbols.push_back(declareLocal(std::move(ps)));
     }
@@ -2341,6 +3752,12 @@ void TypeChecker::noteUse(const Symbol *sym, const SourceLocation &loc) {
   const char *why = sym->usage == Usage::Linear
                          ? " (linear bindings are used exactly once)"
                          : " (owned bindings are affine; declare 'shared var' to copy)";
+  if (consume_) {
+    for (const auto &b : borrows_)
+      if (b.owner == sym && b.refBinding)
+        diags_.error(loc, "cannot move '" + sym->name + "' while '" + b.refBinding->name +
+                              "' borrows it");
+  }
   if (!consume_) {
     if (moved_.count(sym))
       diags_.error(loc, "use of moved value '" + sym->name + "'" + why);
@@ -2464,6 +3881,29 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
   consume_ = savedConsume;
   if (recv->isError())
     return recv;
+  bool viaRef = false;
+  bool viaMut = false;
+  if (recv->kind == TypeKind::Ref && recv->elem) {
+    viaRef = true;
+    viaMut = recv->refMut;
+    recv = recv->elem;
+  }
+  auto mutablePlace = [&](const char *what) {
+    if (viaRef)
+      return viaMut ? true : (fail(m.loc, std::string("'") + what + "' needs '&mut'"), false);
+    if (m.receiver->kind != ExprKind::Ident)
+      return fail(m.receiver->loc, std::string("'") + what + "' updates a named variable"), false;
+    const Symbol *sym = as<IdentExpr>(*m.receiver).symbol;
+    bool throughLoan = false;
+    if (sym) {
+      for (const auto &b : borrows_)
+        if (b.refBinding == sym)
+          throughLoan = true;
+    }
+    if (sym && !throughLoan)
+      rejectIfBorrowed(sym, m.loc, true);
+    return true;
+  };
   if (recv->kind == TypeKind::Struct && !m.invoked) {
     for (size_t i = 0; i < recv->params.size(); ++i) {
       const Symbol *field = i < recv->paramSymbols.size() ? recv->paramSymbols[i] : nullptr;
@@ -2486,26 +3926,38 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
     return false;
   };
 
+  auto unknown = [&](const std::string &msg) -> TypePtr {
+    if (TypePtr dispatched = tryTraitMethod(e, recv, expected))
+      return dispatched;
+    return fail(m.loc, msg);
+  };
+
   if (recv->kind == TypeKind::Text) {
     if (m.method == "length")
       return arity(0) ? Type::i64() : Type::error();
     if (m.method == "data")
       return arity(0) ? Type::ptr() : Type::error();
-    return fail(m.loc, "Text has no method '" + m.method + "' (expected length or data)");
+    return unknown("Text has no method '" + m.method + "' (expected length or data)");
   }
 
   if (recv->kind == TypeKind::Ptr) {
-    if (m.method == "addr")
-      return arity(0) ? Type::i64() : Type::error();
-    return fail(m.loc, "ptr has no method '" + m.method + "'");
+    if (m.method == "addr") {
+      if (!arity(0))
+        return Type::error();
+      requireUnsafe(m.loc, "pointer-to-integer conversion 'ptr.addr()'");
+      return Type::i64();
+    }
+    return unknown("ptr has no method '" + m.method + "'");
   }
 
   if (recv->kind == TypeKind::Slice) {
     if (m.method == "length")
       return arity(0) ? Type::i64() : Type::error();
-    if (m.method == "at") {
+    if (m.method == "at" || m.method == "at_unchecked") {
       if (!arity(1))
         return Type::error();
+      if (m.method == "at_unchecked")
+        requireUnsafe(m.loc, "unchecked indexing");
       TypePtr idx = checkExpr(m.args[0], Type::i64().get());
       if (idx->isError())
         return idx;
@@ -2513,17 +3965,77 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
         return fail(m.args[0]->loc, "'at' index must be 'i64', found '" + idx->str() + "'");
       return recv->elem;
     }
-    return fail(m.loc, "Slice has no method '" + m.method + "' (expected length or at)");
+    return unknown("Slice has no method '" + m.method +
+                       "' (expected length, at or at_unchecked)");
   }
 
   if (recv->kind == TypeKind::Vector) {
     if (m.method == "length")
-      return arity(0) ? Type::i32() : Type::error();
+      return arity(0) ? Type::i64() : Type::error();
     if (m.method == "data")
       return arity(0) ? Type::ptr() : Type::error();
-    if (m.method == "at") {
+    if (m.method == "slice") {
+      if (!arity(0))
+        return Type::error();
+      if (m.receiver->kind != ExprKind::Ident)
+        return fail(m.loc, "'slice' requires a named Vector");
+      const Symbol *named = as<IdentExpr>(*m.receiver).symbol;
+      if (!named)
+        return fail(m.loc, "'slice' requires a named Vector");
+      const Symbol *root = named;
+      for (const auto &b : borrows_)
+        if (b.refBinding == named && b.owner)
+          root = b.owner;
+      e->loanOwner = root;
+      acquireBorrow(root, nullptr, false, m.loc);
+      return Type::slice(recv->elem, recv->region);
+    }
+    if (m.method == "push") {
+      if (!arity(1) || !mutablePlace("push"))
+        return Type::error();
+      TypePtr vt = checkExpr(m.args[0], recv->elem.get());
+      if (vt->isError() || !unify(*vt, *recv->elem, m.args[0]->loc, "'push'"))
+        return Type::error();
+      return Type::voidTy();
+    }
+    if (m.method == "pop") {
+      if (!arity(0) || !mutablePlace("pop"))
+        return Type::error();
+      return recv->elem;
+    }
+    if (m.method == "set") {
+      if (!arity(2) || !mutablePlace("set"))
+        return Type::error();
+      TypePtr idx = checkExpr(m.args[0], Type::i64().get());
+      TypePtr vt = checkExpr(m.args[1], recv->elem.get());
+      if (idx->isError() || vt->isError())
+        return Type::error();
+      if (idx->kind != TypeKind::I64)
+        return fail(m.args[0]->loc, "'set' index must be 'i64', found '" + idx->str() + "'");
+      if (!unify(*vt, *recv->elem, m.args[1]->loc, "'set'"))
+        return Type::error();
+      return Type::voidTy();
+    }
+    if (m.method == "reserve" || m.method == "clear") {
+      if (m.method == "clear") {
+        if (!arity(0) || !mutablePlace("clear"))
+          return Type::error();
+        return Type::voidTy();
+      }
+      if (!arity(1) || !mutablePlace("reserve"))
+        return Type::error();
+      TypePtr n = checkExpr(m.args[0], Type::i64().get());
+      if (n->isError())
+        return n;
+      if (n->kind != TypeKind::I64)
+        return fail(m.args[0]->loc, "'reserve' length must be 'i64', found '" + n->str() + "'");
+      return Type::voidTy();
+    }
+    if (m.method == "at" || m.method == "at_unchecked") {
       if (!arity(1))
         return Type::error();
+      if (m.method == "at_unchecked")
+        requireUnsafe(m.loc, "unchecked indexing");
       TypePtr idx = checkExpr(m.args[0], Type::i64().get());
       if (idx->isError())
         return idx;
@@ -2561,22 +4073,46 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
         return fail(m.args[0]->loc, "'map' must produce runtime data, found '" + at->ret->str() + "'");
       return Type::vector(at->ret, currentRegion_);
     }
-    return fail(m.loc, "Vector has no method '" + m.method +
-                          "' (expected length, data, at, sum, filter or map)");
+    return unknown("Vector has no method '" + m.method +
+                       "' (expected length, data, slice, at, at_unchecked, set, push, pop, reserve, clear, sum, filter or map)");
   }
 
   if (recv->kind == TypeKind::String) {
-    if (m.method == "length")
-      return arity(0) ? Type::i32() : Type::error();
-    if (m.method == "byte_len")
+    if (m.method == "length" || m.method == "byte_len")
       return arity(0) ? Type::i64() : Type::error();
     if (m.method == "data")
       return arity(0) ? Type::ptr() : Type::error();
+    if (m.method == "bytes") {
+      if (!arity(0))
+        return Type::error();
+      if (m.receiver->kind == ExprKind::Ident) {
+        const Symbol *named = as<IdentExpr>(*m.receiver).symbol;
+        if (named) {
+          const Symbol *root = named;
+          for (const auto &b : borrows_)
+            if (b.refBinding == named && b.owner)
+              root = b.owner;
+          e->loanOwner = root;
+          acquireBorrow(root, nullptr, false, m.loc);
+        }
+      }
+      return Type::slice(Type::u8(), recv->region);
+    }
+    if (m.method == "append") {
+      if (!arity(1) || !mutablePlace("append"))
+        return Type::error();
+      TypePtr other = checkExpr(m.args[0], Type::stringTy(0).get());
+      if (other->isError())
+        return other;
+      if (other->kind != TypeKind::String)
+        return fail(m.args[0]->loc, "'append' expects a String, found '" + other->str() + "'");
+      return Type::voidTy();
+    }
     if (m.method == "set_len") {
       if (!arity(1))
         return Type::error();
-      if (m.receiver->kind != ExprKind::Ident)
-        return fail(m.receiver->loc, "'set_len' updates a named variable");
+      if (!mutablePlace("set_len"))
+        return Type::error();
       TypePtr n = checkExpr(m.args[0], Type::i64().get());
       if (n->isError())
         return n;
@@ -2584,18 +4120,22 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
         return fail(m.args[0]->loc, "'set_len' length must be 'i64', found '" + n->str() + "'");
       return Type::voidTy();
     }
-    return fail(m.loc, "String has no method '" + m.method +
-                           "' (expected length, byte_len, data or set_len)");
+    return unknown("String has no method '" + m.method +
+                       "' (expected length, byte_len, data, bytes, append or set_len)");
   }
 
   if (recv->kind == TypeKind::Map) {
     if (m.method == "length")
-      return arity(0) ? Type::i32() : Type::error();
+      return arity(0) ? Type::i64() : Type::error();
+    if (!recv->a->isInteger() && recv->a->kind != TypeKind::Bool && recv->a->kind != TypeKind::Ptr &&
+        !recv->a->isFloat())
+      return fail(m.loc, "Map keys must be an integer, float, bool or ptr, found '" + recv->a->str() +
+                             "'");
     if (m.method == "insert") {
       if (!arity(2))
         return Type::error();
-      if (m.receiver->kind != ExprKind::Ident)
-        return fail(m.receiver->loc, "'insert' updates a named variable");
+      if (!mutablePlace("insert"))
+        return Type::error();
       TypePtr kt = checkExpr(m.args[0], recv->a.get());
       TypePtr vt = checkExpr(m.args[1], recv->b.get());
       if (kt->isError() || vt->isError())
@@ -2613,10 +4153,33 @@ TypePtr TypeChecker::checkMethod(ExprPtr &e, const Type *expected) {
         return Type::error();
       return Type::boolean();
     }
-    return fail(m.loc, "Map has no method '" + m.method + "' (expected insert, contains or length)");
+    if (m.method == "remove") {
+      if (!arity(1) || !mutablePlace("remove"))
+        return Type::error();
+      TypePtr kt = checkExpr(m.args[0], recv->a.get());
+      if (kt->isError() || !unify(*kt, *recv->a, m.args[0]->loc, "'remove' key"))
+        return Type::error();
+      return Type::boolean();
+    }
+    if (m.method == "get") {
+      if (!arity(1))
+        return Type::error();
+      TypePtr kt = checkExpr(m.args[0], recv->a.get());
+      if (kt->isError() || !unify(*kt, *recv->a, m.args[0]->loc, "'get' key"))
+        return Type::error();
+      Symbol *opt = nullptr;
+      if (const Module *mod = registry_.find("option"))
+        if (auto it = mod->symbols.find("Option"); it != mod->symbols.end())
+          opt = it->second;
+      if (!opt || opt->kind != SymbolKind::Type)
+        return fail(m.loc, "'get' returns option.Option; add 'import option'");
+      return instantiateSymbol(*opt, {recv->b}, currentRegion_);
+    }
+    return unknown("Map has no method '" + m.method +
+                       "' (expected insert, contains, remove, get or length)");
   }
 
-  return fail(m.loc, "type '" + recv->str() + "' has no method '" + m.method + "'");
+  return unknown("no implementation of method '" + m.method + "' for '" + recv->str() + "'");
 }
 
 Usage TypeChecker::resolveUsage(Usage annotated, const Type &type, bool shared, bool isConst) const {
@@ -2702,6 +4265,15 @@ void walkExprTree(const Expr &e, const std::function<void(const Expr &)> &fn) {
   case ExprKind::Lambda:
     walkExprTree(*as<LambdaExpr>(e).body, fn);
     break;
+  case ExprKind::Cast:
+    walkExprTree(*as<CastExpr>(e).operand, fn);
+    break;
+  case ExprKind::Borrow:
+    walkExprTree(*as<BorrowExpr>(e).place, fn);
+    break;
+  case ExprKind::Try:
+    walkExprTree(*as<TryExpr>(e).operand, fn);
+    break;
   case ExprKind::Method: {
     const auto &m = as<MethodCallExpr>(e);
     if (m.receiver)
@@ -2748,6 +4320,40 @@ void walkBlockExprs(const Block &block, const std::function<void(const Expr &)> 
       walkBlockExprs(w.body, fn);
       break;
     }
+    case StmtKind::For: {
+      const auto &f = static_cast<const ForStmt &>(*s);
+      if (f.low)
+        walkExprTree(*f.low, fn);
+      if (f.high)
+        walkExprTree(*f.high, fn);
+      if (f.iter)
+        walkExprTree(*f.iter, fn);
+      if (f.step)
+        walkExprTree(*f.step, fn);
+      walkBlockExprs(f.body, fn);
+      break;
+    }
+    case StmtKind::FieldAssign: {
+      const auto &a = static_cast<const FieldAssignStmt &>(*s);
+      if (a.place)
+        walkExprTree(*a.place, fn);
+      if (a.value)
+        walkExprTree(*a.value, fn);
+      break;
+    }
+    case StmtKind::IndexAssign: {
+      const auto &ix = static_cast<const IndexAssignStmt &>(*s);
+      if (ix.place)
+        walkExprTree(*ix.place, fn);
+      if (ix.index)
+        walkExprTree(*ix.index, fn);
+      if (ix.value)
+        walkExprTree(*ix.value, fn);
+      break;
+    }
+    case StmtKind::Break:
+    case StmtKind::Continue:
+      break;
     case StmtKind::Foreach:
       walkBlockExprs(static_cast<const ForeachStmt &>(*s).body, fn);
       break;
@@ -2757,6 +4363,9 @@ void walkBlockExprs(const Block &block, const std::function<void(const Expr &)> 
       break;
     case StmtKind::ScopeArena:
       walkBlockExprs(static_cast<const ScopeArenaStmt &>(*s).body, fn);
+      break;
+    case StmtKind::Unsafe:
+      walkBlockExprs(static_cast<const UnsafeStmt &>(*s).body, fn);
       break;
     case StmtKind::Error:
       break;
@@ -2777,7 +4386,7 @@ void TypeChecker::noteEffect(const Type &callee, const Symbol *sym, const Source
     return;
   }
   if (!callee.effectsDeclared) {
-    if (sym && sym->isExtern)
+    if (sym && (sym->isExtern || sym->kind == SymbolKind::Ctor))
       return;
     diags_.error(loc, "call has an unknown effect row; annotate the callee with '!'");
     return;
@@ -3021,12 +4630,49 @@ void TypeChecker::checkIndexResidues(const Block &block, const std::vector<const
       case StmtKind::Foreach:
         checkIndexResidues(static_cast<const ForeachStmt &>(*stmt).body, {index});
         break;
+      case StmtKind::For: {
+        const auto &f = static_cast<const ForStmt &>(*stmt);
+        if (f.low)
+          check(*f.low);
+        if (f.high)
+          check(*f.high);
+        if (f.iter)
+          check(*f.iter);
+        if (f.step)
+          check(*f.step);
+        checkIndexResidues(f.body, {index});
+        break;
+      }
+      case StmtKind::FieldAssign: {
+        const auto &a = static_cast<const FieldAssignStmt &>(*stmt);
+        if (a.place)
+          check(*a.place);
+        if (a.value)
+          check(*a.value);
+        break;
+      }
+      case StmtKind::IndexAssign: {
+        const auto &ix = static_cast<const IndexAssignStmt &>(*stmt);
+        if (ix.place)
+          check(*ix.place);
+        if (ix.index)
+          check(*ix.index);
+        if (ix.value)
+          check(*ix.value);
+        break;
+      }
+      case StmtKind::Break:
+      case StmtKind::Continue:
+        break;
       case StmtKind::Expr:
         if (static_cast<const ExprStmt &>(*stmt).expr)
           check(*static_cast<const ExprStmt &>(*stmt).expr);
         break;
       case StmtKind::ScopeArena:
         checkIndexResidues(static_cast<const ScopeArenaStmt &>(*stmt).body, {index});
+        break;
+      case StmtKind::Unsafe:
+        checkIndexResidues(static_cast<const UnsafeStmt &>(*stmt).body, {index});
         break;
       case StmtKind::Error:
         break;
@@ -3066,6 +4712,8 @@ bool TypeChecker::cofnTerminates(Block &block, const Symbol *self) {
   }
   case StmtKind::ScopeArena:
     return cofnTerminates(static_cast<ScopeArenaStmt &>(last).body, self);
+  case StmtKind::Unsafe:
+    return cofnTerminates(static_cast<UnsafeStmt &>(last).body, self);
   case StmtKind::Foreach:
     return cofnTerminates(static_cast<ForeachStmt &>(last).body, self);
   default:
@@ -3135,11 +4783,23 @@ TypePtr TypeChecker::substTypeVar(const TypePtr &type, const Symbol *var,
       return type;
     return Type::vector(std::move(elem), type->region, type->vecLen ? type->vecLen->clone() : nullptr);
   }
+  if (type->kind == TypeKind::Ref && type->elem) {
+    TypePtr elem = substTypeVar(type->elem, var, replacement);
+    if (elem == type->elem)
+      return type;
+    return Type::refTy(std::move(elem), type->refMut, type->region);
+  }
   if (type->kind == TypeKind::Slice && type->elem) {
     TypePtr elem = substTypeVar(type->elem, var, replacement);
     if (elem == type->elem)
       return type;
     return Type::slice(std::move(elem), type->region);
+  }
+  if (type->kind == TypeKind::Simd && type->elem) {
+    TypePtr elem = substTypeVar(type->elem, var, replacement);
+    if (elem == type->elem)
+      return type;
+    return Type::simd(std::move(elem), type->lanes);
   }
   if (type->kind == TypeKind::Path && type->elem) {
     TypePtr elem = substTypeVar(type->elem, var, replacement);
@@ -3155,9 +4815,35 @@ TypePtr TypeChecker::substTypeVar(const TypePtr &type, const Symbol *var,
       fields.push_back(substTypeVar(field, var, replacement));
       changed = changed || fields.back() != field;
     }
+    std::vector<TypePtr> targs;
+    for (const auto &arg : type->typeArgs) {
+      targs.push_back(substTypeVar(arg, var, replacement));
+      changed = changed || targs.back() != arg;
+    }
     if (!changed)
       return type;
-    return Type::structOf(type->inductive, std::move(fields), type->paramSymbols);
+    TypePtr out = Type::structOf(type->inductive, std::move(fields), type->paramSymbols);
+    auto edited = std::const_pointer_cast<Type>(out);
+    edited->typeArgs = std::move(targs);
+    edited->typeParams = type->typeParams;
+    edited->region = type->region;
+    return out;
+  }
+  if (type->kind == TypeKind::Inductive) {
+    bool changed = false;
+    std::vector<TypePtr> targs;
+    for (const auto &arg : type->typeArgs) {
+      targs.push_back(substTypeVar(arg, var, replacement));
+      changed = changed || targs.back() != arg;
+    }
+    if (!changed)
+      return type;
+    TypePtr out = Type::inductiveOf(type->inductive);
+    auto edited = std::const_pointer_cast<Type>(out);
+    edited->typeArgs = std::move(targs);
+    edited->typeParams = type->typeParams;
+    edited->region = type->region;
+    return out;
   }
   if (type->kind != TypeKind::Fn)
     return type;
@@ -3212,8 +4898,13 @@ TypePtr TypeChecker::checkStructCall(CallExpr &call, const Type &structType) {
                                                     *call.args[i]);
     }
   }
-  return ok ? Type::structOf(structType.inductive, structType.params, structType.paramSymbols)
-            : Type::error();
+  if (!ok)
+    return Type::error();
+  TypePtr result = Type::structOf(structType.inductive, structType.params, structType.paramSymbols);
+  auto edited = std::const_pointer_cast<Type>(result);
+  edited->typeArgs = structType.typeArgs;
+  edited->region = structType.region;
+  return result;
 }
 
 void TypeChecker::checkAlong(CallExpr &call, const Type &fnType) {
@@ -3235,6 +4926,257 @@ void TypeChecker::checkAlong(CallExpr &call, const Type &fnType) {
   ExprPtr newState = call.args[0]->clone();
   TypePtr want = Type::path(fnType.params[0], std::move(oldState), std::move(newState));
   unify(*proof, *want, call.along->loc, "cofn step");
+}
+
+std::vector<const Symbol *> TypeChecker::openTypeBinders(const std::vector<FnDecl::TypeBinder> &binders) {
+  std::vector<const Symbol *> out;
+  for (const auto &b : binders) {
+    int level = 0;
+    if (!b.bound) {
+      diags_.error(b.loc, "type binder '" + b.name + "' needs a universe, as in [T: Type(0)]");
+    } else {
+      TypePtr bound = resolveType(*b.bound);
+      if (bound->kind != TypeKind::Universe)
+        diags_.error(b.bound->loc, "type binder '" + b.name +
+                                       "' must be bounded by a universe, found '" + bound->str() + "'");
+      else
+        level = bound->level;
+    }
+    Symbol ts;
+    ts.kind = SymbolKind::TypeParam;
+    ts.name = b.name;
+    ts.type = Type::universe(level);
+    ts.loc = b.loc;
+    out.push_back(declareLocal(std::move(ts)));
+  }
+  return out;
+}
+
+TypePtr TypeChecker::instantiateBinders(TypePtr type, const std::vector<const Symbol *> &binders,
+                                        const std::vector<TypePtr> &args) const {
+  for (size_t i = 0; i < binders.size() && i < args.size(); ++i)
+    type = substTypeVar(type, binders[i], args[i]);
+  return type;
+}
+
+TypePtr TypeChecker::instantiateSymbol(const Symbol &sym, const std::vector<TypePtr> &args,
+                                       int region) {
+  if (!sym.type)
+    return Type::error();
+  if (sym.type->kind == TypeKind::Struct) {
+    TypePtr t = instantiateBinders(sym.type, sym.typeBinders, args);
+    auto edited = std::const_pointer_cast<Type>(t);
+    edited->typeArgs = args;
+    edited->region = region;
+    return t;
+  }
+  TypePtr t = Type::inductiveOf(&sym);
+  auto edited = std::const_pointer_cast<Type>(t);
+  edited->typeArgs = args;
+  edited->typeParams = sym.typeBinders;
+  edited->region = region;
+  return t;
+}
+
+TypePtr TypeChecker::inferTypeArg(const Type &param, const TypePtr &arg, const Symbol *var) const {
+  if (!arg || !var)
+    return nullptr;
+  if (param.kind == TypeKind::TyVar && param.tyVar == var)
+    return arg;
+  if (param.elem && arg->elem && param.kind == arg->kind &&
+      (param.kind == TypeKind::Vector || param.kind == TypeKind::Slice || param.kind == TypeKind::Ref ||
+       param.kind == TypeKind::Labeled || param.kind == TypeKind::Quotient))
+    return inferTypeArg(*param.elem, arg->elem, var);
+  if (param.kind == TypeKind::Map && arg->kind == TypeKind::Map && param.a && param.b && arg->a &&
+      arg->b) {
+    if (TypePtr key = inferTypeArg(*param.a, arg->a, var))
+      return key;
+    return inferTypeArg(*param.b, arg->b, var);
+  }
+  if ((param.kind == TypeKind::Struct || param.kind == TypeKind::Inductive) &&
+      param.kind == arg->kind && param.inductive == arg->inductive) {
+    for (size_t i = 0; i < param.typeArgs.size() && i < arg->typeArgs.size(); ++i)
+      if (TypePtr got = inferTypeArg(*param.typeArgs[i], arg->typeArgs[i], var))
+        return got;
+  }
+  return nullptr;
+}
+
+TypePtr TypeChecker::checkCast(CastExpr &e) {
+  TypePtr target = resolveType(*e.typeExpr);
+  if (target->isError())
+    return target;
+  TypePtr src = checkExpr(e.operand, target->isNumeric() ? target.get() : nullptr);
+  if (src->isError())
+    return src;
+  if (normalizer_.typeEqual(*src, *target))
+    return target;
+  bool srcInt = src->isInteger();
+  bool dstInt = target->isInteger();
+  bool srcFloat = src->isFloat();
+  bool dstFloat = target->isFloat();
+  auto addressSized = [](const Type &ty) {
+    return ty.kind == TypeKind::I64 || ty.kind == TypeKind::U64 || ty.kind == TypeKind::ISize ||
+           ty.kind == TypeKind::USize;
+  };
+  bool ok = (srcInt && dstInt) || (srcInt && dstFloat) || (srcFloat && dstInt) ||
+            (srcFloat && dstFloat) || (src->kind == TypeKind::Bool && dstInt) ||
+            (src->kind == TypeKind::Ptr && addressSized(*target)) ||
+            (addressSized(*src) && target->kind == TypeKind::Ptr);
+  if (!ok)
+    return fail(e.loc, "cannot cast '" + src->str() + "' to '" + target->str() + "'");
+  if ((src->kind == TypeKind::Ptr && target->isInteger()) ||
+      (src->isInteger() && target->kind == TypeKind::Ptr))
+    requireUnsafe(e.loc, "a pointer/integer conversion");
+  return target;
+}
+
+TypePtr TypeChecker::checkBorrow(BorrowExpr &e) {
+  bool saved = consume_;
+  bool savedPlace = inBorrowPlace_;
+  consume_ = false;
+  inBorrowPlace_ = true;
+  TypePtr pt = checkExpr(e.place);
+  consume_ = saved;
+  inBorrowPlace_ = savedPlace;
+  if (pt->isError())
+    return pt;
+  if (pt->isErased())
+    return fail(e.loc, "cannot borrow erased type '" + pt->str() + "'");
+  if (e.place->kind == ExprKind::Ident)
+    e.owner = as<IdentExpr>(*e.place).symbol;
+  if (e.mut) {
+    if (!e.owner || e.owner->isConst || e.owner->kind == SymbolKind::Param)
+      return fail(e.loc, "'&mut' requires a mutable 'var'");
+  }
+  if (e.owner) {
+    acquireBorrow(e.owner, nullptr, e.mut, e.loc);
+    e.loanOwner = e.owner;
+  }
+  int region = pt->region;
+  // A borrow of a local, a parameter, or an arena temporary dies with that
+  // scope. Arena regions already fail requireLives at the boundary. Locals
+  // share the heap region, so returning one is rejected at `ret`.
+  if (insideArena())
+    region = currentRegion_;
+  return Type::refTy(pt, e.mut, region);
+}
+
+TypePtr TypeChecker::checkTry(TryExpr &e) {
+  TypePtr inner = checkExpr(e.operand);
+  if (inner->isError())
+    return inner;
+  if (!currentRet_ || inner->kind != TypeKind::Inductive || !inner->inductive)
+    return fail(e.loc, "'?' expects a Result or Option in a function that returns one");
+  const std::string &name = inner->inductive->name;
+  if (name == "Option" && inner->typeArgs.size() == 1) {
+    if (currentRet_->kind != TypeKind::Inductive || !currentRet_->inductive ||
+        currentRet_->inductive->name != "Option")
+      return fail(e.loc, "'?' on Option requires the function to return Option");
+    return inner->typeArgs[0];
+  }
+  if (name == "Result" && inner->typeArgs.size() == 2) {
+    if (currentRet_->kind != TypeKind::Inductive || !currentRet_->inductive ||
+        currentRet_->inductive->name != "Result" || currentRet_->typeArgs.size() != 2 ||
+        !normalizer_.typeEqual(*currentRet_->typeArgs[1], *inner->typeArgs[1]))
+      return fail(e.loc, "'?' error type must match the function's Result error");
+    return inner->typeArgs[0];
+  }
+  return fail(e.loc, "'?' expects Result(T, E) or Option(T), found '" + inner->str() + "'");
+}
+
+void TypeChecker::popScope() {
+  scopes_.pop_back();
+  releaseScopeBorrows();
+}
+
+void TypeChecker::releaseScopeBorrows() {
+  int depth = static_cast<int>(scopes_.size());
+  borrows_.erase(std::remove_if(borrows_.begin(), borrows_.end(),
+                                [depth](const LiveBorrow &b) { return b.scopeDepth > depth; }),
+                 borrows_.end());
+}
+
+void TypeChecker::releaseStatementBorrows() {
+  borrows_.erase(std::remove_if(borrows_.begin(), borrows_.end(),
+                                [](const LiveBorrow &b) { return b.refBinding == nullptr; }),
+                 borrows_.end());
+}
+
+void TypeChecker::acquireBorrow(const Symbol *owner, const Symbol *binding, bool mut,
+                                const SourceLocation &loc) {
+  if (!owner)
+    return;
+  for (const auto &b : borrows_) {
+    if (b.owner != owner)
+      continue;
+    if (mut || b.mut) {
+      diags_.error(loc, "overlapping mutable borrow of '" + owner->name + "'");
+      break;
+    }
+  }
+  borrows_.push_back(LiveBorrow{owner, binding, mut, static_cast<int>(scopes_.size())});
+}
+
+void TypeChecker::bindLoan(const Expr &init, const Symbol *binding) {
+  if (!binding)
+    return;
+  const Symbol *owner = init.loanOwner;
+  bool mut = false;
+  if (init.kind == ExprKind::Borrow) {
+    const auto &b = as<BorrowExpr>(init);
+    if (b.owner)
+      owner = b.owner;
+    mut = b.mut;
+  } else if (init.type && init.type->kind == TypeKind::Ref && init.type->refMut) {
+    mut = true;
+  }
+  if (!owner)
+    return;
+  for (auto it = borrows_.rbegin(); it != borrows_.rend(); ++it) {
+    if (it->owner == owner && it->refBinding == nullptr && it->mut == mut) {
+      it->refBinding = binding;
+      return;
+    }
+  }
+  acquireBorrow(owner, binding, mut, init.loc);
+}
+
+void TypeChecker::rejectIfBorrowed(const Symbol *owner, const SourceLocation &loc, bool mutating) {
+  if (!owner)
+    return;
+  for (const auto &b : borrows_) {
+    if (b.owner != owner)
+      continue;
+    if (!mutating && !b.mut)
+      continue;
+    if (mutating)
+      diags_.error(loc, "cannot mutate '" + owner->name + "' while it is borrowed");
+    else
+      diags_.error(loc, "cannot use '" + owner->name + "' while it is mutably borrowed");
+    return;
+  }
+}
+
+void TypeChecker::requireUnsafe(const SourceLocation &loc, const std::string &what) {
+  if (unsafeDepth_ > 0)
+    return;
+  if (currentFn_ && currentFn_->isExtern)
+    return;
+  diags_.error(loc, what + " requires 'unsafe'");
+}
+
+void TypeChecker::noteSpawnShared(const CallExpr &call) {
+  if (call.args.size() < 2 || !call.args[1])
+    return;
+  const Expr &arg = *call.args[1];
+  const Symbol *sym = nullptr;
+  if (arg.kind == ExprKind::Borrow)
+    sym = as<BorrowExpr>(arg).owner;
+  else if (arg.kind == ExprKind::Ident)
+    sym = as<IdentExpr>(arg).symbol;
+  if (!sym || !sym->shared)
+    diags_.error(arg.loc, "spawn requires a shared value");
 }
 
 } // namespace cruft::sema

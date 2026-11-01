@@ -1,0 +1,44 @@
+package demo
+
+import iter
+import fmt
+import io
+import fs
+
+pub fn main(argc: i32, argv: ptr): i32
+    unsafe
+        if argv == null() then
+            ret 1
+        end
+    end
+    var it = iter.range(1, 4)
+    var sum: i64 = 0
+    for n in it do
+        sum = sum + n
+    end
+    print(sum)
+    var shown: i64 = 36
+    var flag = true
+    io.println(shown.to_string())
+    io.println(flag.to_string())
+    var width: usize = 8
+    var signed: isize = 0 - 3
+    print(width)
+    print(signed)
+    print(argc)
+    var wrote = fs.write_file("cruft_phase_d.txt", "hello")
+    var failed = match wrote
+        case Ok(n) then false
+        case Err(code) then true
+    end
+    if failed then
+        ret 2
+    end
+    var body = fs.read_to_string("cruft_phase_d.txt")
+    var text = match body
+        case Ok(s) then s
+        case Err(code) then ""
+    end
+    io.println(text)
+    ret 0
+end

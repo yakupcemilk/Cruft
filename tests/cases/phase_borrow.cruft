@@ -1,0 +1,14 @@
+package demo
+
+fn push_one(xs: &mut Vector(i32))
+    xs.push(7)
+end
+
+pub fn main(): i32
+    var xs: Vector(i32) = []
+    push_one(&mut xs)
+    var r = &xs
+    print(r.length())
+    print(xs.at(0))
+    ret 0
+end

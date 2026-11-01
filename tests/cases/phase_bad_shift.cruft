@@ -1,0 +1,7 @@
+package demo
+
+pub fn main(): i32
+    var b = true
+    var n = b << 1
+    ret n
+end

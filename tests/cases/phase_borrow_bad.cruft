@@ -1,0 +1,12 @@
+package demo
+
+pub fn bad(): &i32
+    scope arena
+        var x: i32 = 1
+        ret &x
+    end
+end
+
+pub fn main(): i32
+    ret 0
+end

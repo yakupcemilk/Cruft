@@ -10,6 +10,10 @@
 //               | Vis? 'fn' IDENT ('[' IDENT ']')? '(' Params ')' (':' Type)? Effect? Block 'end'
 //               | Vis? 'cofn' IDENT ('[' IDENT ']')? '(' Params ')' (':' Type)? Effect? Block 'end'
 //               | Vis? 'axiom' IDENT ':' Type
+//               | Vis? 'trait' IDENT MethodSig* 'end'
+//               | Vis? 'impl' TraitName ('[' Binders ']')? 'for' Type Method* 'end'
+//               | Vis? 'const' 'fn' IDENT '(' Params ')' (':' Type)? Block 'end'
+//               | 'cfg' CfgPred Item* 'end'
 //   Effect     := '!' '{' EffectName* '}' | '!' IDENT
 //   EffectName := 'io' | 'alloc' | 'net'
 //               | Vis? ('var' | 'const') IDENT ':' Type '=' Expr
@@ -42,8 +46,10 @@ namespace cruft {
 
 using namespace ast;
 
-Parser::Parser(std::vector<Token> tokens, std::string filename, DiagnosticEngine &diags)
-    : tokens_(std::move(tokens)), filename_(std::move(filename)), diags_(diags) {}
+Parser::Parser(std::vector<Token> tokens, std::string filename, DiagnosticEngine &diags,
+               TargetFacts target)
+    : tokens_(std::move(tokens)), filename_(std::move(filename)), diags_(diags),
+      target_(std::move(target)) {}
 
 // ---------------------------------------------------------------------------
 // Token cursor helpers
@@ -131,12 +137,16 @@ bool Parser::isRecoveryBoundary(TokenKind k, bool topLevel) const {
   case TokenKind::KwAxiom:
   case TokenKind::KwStruct:
   case TokenKind::KwEnum:
+  case TokenKind::KwTrait:
+  case TokenKind::KwImpl:
+  case TokenKind::KwCfg:
     return true;
   case TokenKind::KwRet:
   case TokenKind::KwIf:
   case TokenKind::KwWhile:
   case TokenKind::KwForeach:
   case TokenKind::KwScope:
+  case TokenKind::KwUnsafe:
     return !topLevel;
   default:
     return false;
@@ -156,7 +166,11 @@ bool Parser::isTopLevelStart(TokenKind k) const {
   case TokenKind::KwAxiom:
   case TokenKind::KwStruct:
   case TokenKind::KwEnum:
+  case TokenKind::KwTrait:
+  case TokenKind::KwImpl:
+  case TokenKind::KwCfg:
   case TokenKind::KwType:
+  case TokenKind::KwDrop:
   case TokenKind::KwVar:
   case TokenKind::KwConst:
   case TokenKind::KwShared:
@@ -282,13 +296,30 @@ void Parser::parseTopLevel(File &file) {
     advance();
     file.axioms.push_back(parseAxiom(vis));
     return;
-  case TokenKind::KwVar:
-  case TokenKind::KwConst: {
+  case TokenKind::KwConst:
+    if (peek(1).kind == TokenKind::KwFn) {
+      if (shared)
+        fail(peek(), "'shared' applies to a value, not a function");
+      advance();
+      advance();
+      auto fn = parseFunction(vis, /*isExtern=*/false, /*isCofn=*/false);
+      fn->isConstFn = true;
+      file.functions.push_back(std::move(fn));
+      return;
+    }
+    [[fallthrough]];
+  case TokenKind::KwVar: {
     auto g = parseGlobal(vis);
     g->shared = shared;
     file.globals.push_back(std::move(g));
     return;
   }
+  case TokenKind::KwCfg:
+    if (shared)
+      fail(peek(), "'shared' applies to a value, not 'cfg'");
+    advance();
+    parseCfg(file);
+    return;
   case TokenKind::KwType:
     advance();
     file.types.push_back(parseTypeDecl(vis, /*isEnum=*/false));
@@ -301,19 +332,51 @@ void Parser::parseTopLevel(File &file) {
     advance();
     file.structs.push_back(parseStruct(vis));
     return;
+  case TokenKind::KwTrait:
+    advance();
+    parseTrait(file, vis);
+    return;
+  case TokenKind::KwImpl:
+    advance();
+    parseImpl(file, vis);
+    return;
+  case TokenKind::KwDrop: {
+    advance();
+    auto fn = std::make_unique<FnDecl>();
+    fn->visibility = vis;
+    fn->isDrop = true;
+    fn->loc = peek().loc;
+    std::string typeName = expectIdentifier("as the type cleaned up by 'drop'");
+    fn->dropTypeName = typeName;
+    fn->name = "__drop_" + typeName;
+    fn->params = parseParamList();
+    fn->body = parseBlock({TokenKind::KwEnd});
+    expect(TokenKind::KwEnd, "to close 'drop'");
+    file.functions.push_back(std::move(fn));
+    return;
+  }
   default:
     if (shared)
       fail(peek(), "expected 'var' or 'const' after 'shared'");
-    fail(peek(), "expected a declaration ('fn', 'cofn', 'axiom', 'extern', 'var', 'const', 'type' or 'import'), found " +
+    fail(peek(), "expected a declaration ('fn', 'const fn', 'cofn', 'axiom', 'extern', 'var', 'const', 'type', 'trait', 'impl', 'cfg' or 'import'), found " +
                      std::string(tokenKindName(peek().kind)));
   }
 }
 
-std::vector<Param> Parser::parseParamList() {
+std::vector<Param> Parser::parseParamList(bool *varArg) {
   std::vector<Param> params;
   expect(TokenKind::LParen, "to open parameter list");
   if (!at(TokenKind::RParen)) {
     do {
+      if (at(TokenKind::Ellipsis)) {
+        if (!varArg)
+          fail(peek(), "'...' is only allowed on an 'extern fn'");
+        advance();
+        *varArg = true;
+        if (!at(TokenKind::RParen))
+          fail(peek(), "'...' must be the last parameter");
+        break;
+      }
       Param p;
       p.loc = peek().loc;
       if (accept(TokenKind::KwLin))
@@ -328,6 +391,21 @@ std::vector<Param> Parser::parseParamList() {
   }
   expect(TokenKind::RParen, "to close parameter list");
   return params;
+}
+
+std::vector<FnDecl::TypeBinder> Parser::parseTypeBinders() {
+  std::vector<FnDecl::TypeBinder> binders;
+  expect(TokenKind::LBracket, "to open type binders");
+  do {
+    FnDecl::TypeBinder b;
+    b.loc = peek().loc;
+    b.name = expectIdentifier("as a type binder");
+    expect(TokenKind::Colon, "after type binder");
+    b.bound = parseType();
+    binders.push_back(std::move(b));
+  } while (accept(TokenKind::Comma));
+  expect(TokenKind::RBracket, "to close type binders");
+  return binders;
 }
 
 Parser::EffectClause Parser::parseEffectClause() {
@@ -354,7 +432,8 @@ Parser::EffectClause Parser::parseEffectClause() {
   return clause;
 }
 
-std::unique_ptr<FnDecl> Parser::parseFunction(Visibility vis, bool isExtern, bool isCofn) {
+std::unique_ptr<FnDecl> Parser::parseFunction(Visibility vis, bool isExtern, bool isCofn,
+                                             bool signatureOnly) {
   auto fn = std::make_unique<FnDecl>();
   fn->visibility = vis;
   fn->isExtern = isExtern;
@@ -364,9 +443,23 @@ std::unique_ptr<FnDecl> Parser::parseFunction(Visibility vis, bool isExtern, boo
   if (accept(TokenKind::LBracket)) {
     std::string binder = expectIdentifier("as type or effect variable");
     if (accept(TokenKind::Colon)) {
-      fn->typeParam = std::move(binder);
-      fn->typeParamBound = parseType();
-      expect(TokenKind::RBracket, "after type binder");
+      FnDecl::TypeBinder first;
+      first.loc = fn->loc;
+      first.name = std::move(binder);
+      first.bound = parseType();
+      fn->typeBinders.push_back(std::move(first));
+      while (accept(TokenKind::Comma)) {
+        FnDecl::TypeBinder b;
+        b.loc = peek().loc;
+        b.name = expectIdentifier("as a type binder");
+        expect(TokenKind::Colon, "after type binder");
+        b.bound = parseType();
+        fn->typeBinders.push_back(std::move(b));
+      }
+      expect(TokenKind::RBracket, "after type binders");
+      fn->typeParam = fn->typeBinders.front().name;
+      if (fn->typeBinders.front().bound)
+        fn->typeParamBound = fn->typeBinders.front().bound->clone();
     } else {
       fn->effectVar = std::move(binder);
       expect(TokenKind::RBracket, "after effect variable");
@@ -375,7 +468,9 @@ std::unique_ptr<FnDecl> Parser::parseFunction(Visibility vis, bool isExtern, boo
   std::string savedBinder = effectBinder_;
   if (!fn->effectVar.empty())
     effectBinder_ = fn->effectVar;
-  fn->params = parseParamList();
+  bool varArg = false;
+  fn->params = parseParamList(isExtern ? &varArg : nullptr);
+  fn->isVarArg = varArg;
   if (accept(TokenKind::Colon))
     fn->ret = parseType();
   if (accept(TokenKind::Bang)) {
@@ -389,8 +484,8 @@ std::unique_ptr<FnDecl> Parser::parseFunction(Visibility vis, bool isExtern, boo
     }
   }
   effectBinder_ = std::move(savedBinder);
-  if (isExtern)
-    return fn; // no body: foreign prototype
+  if (isExtern || signatureOnly)
+    return fn; // no body: foreign prototype or trait signature
 
   const FnDecl *saved = currentFn_;
   currentFn_ = fn.get();
@@ -398,6 +493,121 @@ std::unique_ptr<FnDecl> Parser::parseFunction(Visibility vis, bool isExtern, boo
   currentFn_ = saved;
   expect(TokenKind::KwEnd, "to close function body");
   return fn;
+}
+
+namespace {
+
+FnDecl::TypeBinder copyBinder(const FnDecl::TypeBinder &b) {
+  FnDecl::TypeBinder out;
+  out.name = b.name;
+  out.loc = b.loc;
+  if (b.bound)
+    out.bound = b.bound->clone();
+  return out;
+}
+
+} // namespace
+
+void Parser::parseTrait(File &file, Visibility vis) {
+  auto tr = std::make_unique<TraitDecl>();
+  tr->visibility = vis;
+  tr->loc = peek().loc;
+  tr->name = expectIdentifier("as trait name");
+  if (at(TokenKind::LBracket))
+    tr->typeBinders = parseTypeBinders();
+  while (!at(TokenKind::KwEnd) && !at(TokenKind::EndOfFile)) {
+    expect(TokenKind::KwFn, "to start a trait method");
+    tr->methods.push_back(parseFunction(vis, /*isExtern=*/false, /*isCofn=*/false,
+                                        /*signatureOnly=*/true));
+  }
+  expect(TokenKind::KwEnd, "to close trait");
+  file.traits.push_back(std::move(tr));
+}
+
+void Parser::parseImpl(File &file, Visibility vis) {
+  auto impl = std::make_unique<ImplDecl>();
+  impl->visibility = vis;
+  impl->loc = peek().loc;
+  impl->traitName = expectIdentifier("as trait name");
+  if (accept(TokenKind::Dot)) {
+    impl->traitPackage = std::move(impl->traitName);
+    impl->traitName = expectIdentifier("as trait name");
+  }
+  if (at(TokenKind::LBracket)) {
+    // `impl Trait[T: Type(0)]` binds T. `impl Trait[i64]` supplies a type.
+    const bool binders = peek(1).kind == TokenKind::Identifier && peek(2).kind == TokenKind::Colon;
+    if (binders) {
+      impl->binders = parseTypeBinders();
+    } else {
+      expect(TokenKind::LBracket, "to open trait arguments");
+      if (!at(TokenKind::RBracket)) {
+        do {
+          impl->traitArgs.push_back(parseType());
+        } while (accept(TokenKind::Comma));
+      }
+      expect(TokenKind::RBracket, "after trait arguments");
+    }
+  }
+  expect(TokenKind::KwFor, "before the implemented type");
+  impl->target = parseType();
+  const int index = static_cast<int>(file.impls.size());
+  while (!at(TokenKind::KwEnd) && !at(TokenKind::EndOfFile)) {
+    accept(TokenKind::KwPub);
+    accept(TokenKind::KwPri);
+    expect(TokenKind::KwFn, "to start an impl method");
+    auto fn = parseFunction(Visibility::Private, /*isExtern=*/false, /*isCofn=*/false);
+    if (!fn->typeBinders.empty()) {
+      diags_.error(fn->loc, "put type binders on the impl, as in 'impl Trait[T: Type(0)] for ...'");
+      diags_.beginPanic();
+      throw ParseError{};
+    }
+    for (const auto &b : impl->binders)
+      fn->typeBinders.push_back(copyBinder(b));
+    fn->implIndex = index;
+    file.functions.push_back(std::move(fn));
+  }
+  expect(TokenKind::KwEnd, "to close impl");
+  file.impls.push_back(std::move(impl));
+}
+
+bool Parser::parseCfgPredicate() {
+  const bool neg = accept(TokenKind::KwNot);
+  bool matches = false;
+  auto named = [&](const std::string &have) {
+    const std::string want = expectIdentifier("as a cfg name");
+    matches = have == want;
+  };
+  if (at(TokenKind::Identifier) && peek().text == "os") {
+    advance();
+    named(target_.os);
+  } else if (at(TokenKind::Identifier) && peek().text == "arch") {
+    advance();
+    named(target_.arch);
+  } else if (at(TokenKind::Identifier) && peek().text == "env") {
+    advance();
+    named(target_.env);
+  } else if (at(TokenKind::Identifier) && peek().text == "triple") {
+    advance();
+    const Token &lit = expect(TokenKind::StringLiteral, "as a target triple");
+    matches = TargetFacts::from(lit.text).triple == target_.triple;
+  } else {
+    const std::string name = expectIdentifier("as a cfg predicate ('os', 'arch', 'env', or a name)");
+    matches = name == target_.arch || name == target_.os || name == target_.env;
+  }
+  return neg ? !matches : matches;
+}
+
+void Parser::parseCfg(File &file) {
+  const bool active = parseCfgPredicate();
+  File dropped;
+  dropped.package = file.package;
+  File &dest = active ? file : dropped;
+  while (!at(TokenKind::KwEnd) && !at(TokenKind::EndOfFile)) {
+    if (accept(TokenKind::Semicolon))
+      continue;
+    parseTopLevel(dest);
+  }
+  expect(TokenKind::KwEnd, "to close 'cfg'");
 }
 
 std::unique_ptr<AxiomDecl> Parser::parseAxiom(Visibility vis) {
@@ -428,6 +638,8 @@ std::unique_ptr<StructDecl> Parser::parseStruct(Visibility vis) {
   sd->visibility = vis;
   sd->loc = peek().loc;
   sd->name = expectIdentifier("as struct name");
+  if (at(TokenKind::LBracket))
+    sd->typeBinders = parseTypeBinders();
   while (!at(TokenKind::KwEnd) && !at(TokenKind::EndOfFile)) {
     Param field;
     field.loc = peek().loc;
@@ -446,6 +658,8 @@ std::unique_ptr<TypeDecl> Parser::parseTypeDecl(Visibility vis, bool isEnum) {
   td->isEnum = isEnum;
   td->loc = peek().loc;
   td->name = expectIdentifier("as type name");
+  if (at(TokenKind::LBracket))
+    td->typeBinders = parseTypeBinders();
   while (!at(TokenKind::KwEnd) && !at(TokenKind::EndOfFile)) {
     CtorDecl c;
     c.loc = peek().loc;
@@ -474,7 +688,8 @@ Block Parser::parseBlock(std::initializer_list<TokenKind> terminators) {
     if (at(TokenKind::KwPackage) || at(TokenKind::KwImport) || at(TokenKind::KwExport) ||
         at(TokenKind::KwUse) || at(TokenKind::KwPub) || at(TokenKind::KwPri) ||
         at(TokenKind::KwExtern) || at(TokenKind::KwType) || at(TokenKind::KwCofn) ||
-        at(TokenKind::KwAxiom) || at(TokenKind::KwStruct) || at(TokenKind::KwEnum))
+        at(TokenKind::KwAxiom) || at(TokenKind::KwStruct) || at(TokenKind::KwEnum) ||
+        at(TokenKind::KwTrait) || at(TokenKind::KwImpl))
       return true;
     if ((at(TokenKind::KwFn) || at(TokenKind::KwCofn)) && !aheadIsLambda())
       return true;
@@ -486,6 +701,16 @@ Block Parser::parseBlock(std::initializer_list<TokenKind> terminators) {
   while (!isTerminator()) {
     if (accept(TokenKind::Semicolon))
       continue;
+    if (at(TokenKind::KwCfg)) {
+      advance();
+      const bool active = parseCfgPredicate();
+      Block inner = parseBlock({TokenKind::KwEnd});
+      expect(TokenKind::KwEnd, "to close 'cfg'");
+      if (active)
+        for (auto &stmt : inner)
+          block.push_back(std::move(stmt));
+      continue;
+    }
     block.push_back(parseStatement());
   }
   return block;
@@ -525,6 +750,12 @@ StmtPtr Parser::parseStatementBody() {
     Block body = parseBlock({TokenKind::KwEnd});
     expect(TokenKind::KwEnd, "to close 'scope arena'");
     return std::make_unique<ScopeArenaStmt>(loc, std::move(body));
+  }
+  case TokenKind::KwUnsafe: {
+    SourceLocation loc = advance().loc;
+    Block body = parseBlock({TokenKind::KwEnd});
+    expect(TokenKind::KwEnd, "to close 'unsafe'");
+    return std::make_unique<UnsafeStmt>(loc, std::move(body));
   }
   case TokenKind::KwVar:
   case TokenKind::KwConst: {
@@ -580,10 +811,53 @@ StmtPtr Parser::parseStatementBody() {
     expect(TokenKind::KwEnd, "to close 'while'");
     return std::make_unique<WhileStmt>(loc, std::move(cond), std::move(body));
   }
+  case TokenKind::KwFor: {
+    SourceLocation loc = advance().loc;
+    std::string name = expectIdentifier("as loop binder");
+    std::string in = expectIdentifier("after for binder ('in')");
+    if (in != "in")
+      fail(peek(), "expected 'in' after for binder, found '" + in + "'");
+    ExprPtr first = parseExpr();
+    if (accept(TokenKind::DotDot)) {
+      ExprPtr high = parseExpr();
+      expect(TokenKind::KwDo, "after 'for' bounds");
+      Block body = parseBlock({TokenKind::KwEnd});
+      expect(TokenKind::KwEnd, "to close 'for'");
+      return std::make_unique<ForStmt>(loc, std::move(name), std::move(first), std::move(high),
+                                       std::move(body));
+    }
+    expect(TokenKind::KwDo, "after the 'for' iterator");
+    Block body = parseBlock({TokenKind::KwEnd});
+    expect(TokenKind::KwEnd, "to close 'for'");
+    auto stmt = std::make_unique<ForStmt>(loc, std::move(name), nullptr, nullptr, std::move(body));
+    stmt->iter = std::move(first);
+    return stmt;
+  }
+  case TokenKind::KwBreak:
+    return std::make_unique<BreakStmt>(advance().loc);
+  case TokenKind::KwContinue:
+    return std::make_unique<ContinueStmt>(advance().loc);
   default: {
     SourceLocation loc = tok.loc;
     ExprPtr e = parseExpr();
     if (at(TokenKind::Assign)) {
+      if (e->kind == ExprKind::Method) {
+        auto &m = static_cast<MethodCallExpr &>(*e);
+        if (!m.invoked && m.args.empty()) {
+          advance();
+          ExprPtr value = parseExpr();
+          return std::make_unique<FieldAssignStmt>(loc, std::move(m.receiver), m.method,
+                                                   std::move(value));
+        }
+        if (m.invoked && m.method == "at" && m.args.size() == 1) {
+          advance();
+          ExprPtr value = parseExpr();
+          ExprPtr index = std::move(m.args[0]);
+          ExprPtr place = std::move(m.receiver);
+          return std::make_unique<IndexAssignStmt>(loc, std::move(place), std::move(index),
+                                                   std::move(value));
+        }
+      }
       if (e->kind != ExprKind::Ident || !static_cast<IdentExpr &>(*e).package.empty())
         fail(peek(), "left-hand side of assignment must be a local or module variable");
       advance();
@@ -601,8 +875,16 @@ StmtPtr Parser::parseStatementBody() {
 
 bool Parser::atTypeStart() const {
   switch (peek().kind) {
+  case TokenKind::KwI8:
+  case TokenKind::KwI16:
   case TokenKind::KwI32:
   case TokenKind::KwI64:
+  case TokenKind::KwU8:
+  case TokenKind::KwU16:
+  case TokenKind::KwU32:
+  case TokenKind::KwU64:
+  case TokenKind::KwUSize:
+  case TokenKind::KwISize:
   case TokenKind::KwF32:
   case TokenKind::KwF64:
   case TokenKind::KwBool:
@@ -611,6 +893,7 @@ bool Parser::atTypeStart() const {
   case TokenKind::KwUniverse:
   case TokenKind::KwPath:
   case TokenKind::KwEquiv:
+  case TokenKind::Amp:
     return true;
   case TokenKind::KwFn:
     return peek(1).kind == TokenKind::LParen;
@@ -622,8 +905,23 @@ bool Parser::atTypeStart() const {
 TypeExprPtr Parser::parseType() {
   const Token &tok = peek();
   switch (tok.kind) {
+  case TokenKind::Amp: {
+    auto t = std::make_unique<TypeExpr>(TypeExprKind::Ref, tok.loc);
+    advance();
+    t->refMut = accept(TokenKind::KwMut);
+    t->elem = parseType();
+    return t;
+  }
+  case TokenKind::KwI8:
+  case TokenKind::KwI16:
   case TokenKind::KwI32:
   case TokenKind::KwI64:
+  case TokenKind::KwU8:
+  case TokenKind::KwU16:
+  case TokenKind::KwU32:
+  case TokenKind::KwU64:
+  case TokenKind::KwUSize:
+  case TokenKind::KwISize:
   case TokenKind::KwF32:
   case TokenKind::KwF64:
   case TokenKind::KwBool:
@@ -701,6 +999,14 @@ TypeExprPtr Parser::parseType() {
       t->package = t->name;
       t->name = advance().text;
     }
+    if (t->package.empty() && t->name == "Simd" && at(TokenKind::LParen)) {
+      advance();
+      t->params.push_back(parseType());
+      expect(TokenKind::Comma, "after Simd element type");
+      t->lhs = parseExpr();
+      expect(TokenKind::RParen, "to close 'Simd(T, n)'");
+      return t;
+    }
     if (t->package.empty() && t->name == "Vec" && at(TokenKind::LParen)) {
       advance();
       t->params.push_back(parseType());
@@ -776,10 +1082,37 @@ ExprPtr Parser::parseOr() {
 }
 
 ExprPtr Parser::parseAnd() {
-  ExprPtr lhs = parseEquality();
+  ExprPtr lhs = parseBitOr();
   while (at(TokenKind::KwAnd)) {
     SourceLocation loc = advance().loc;
-    lhs = std::make_unique<BinaryExpr>(loc, BinaryOp::And, std::move(lhs), parseEquality());
+    lhs = std::make_unique<BinaryExpr>(loc, BinaryOp::And, std::move(lhs), parseBitOr());
+  }
+  return lhs;
+}
+
+ExprPtr Parser::parseBitOr() {
+  ExprPtr lhs = parseBitXor();
+  while (at(TokenKind::Pipe)) {
+    SourceLocation loc = advance().loc;
+    lhs = std::make_unique<BinaryExpr>(loc, BinaryOp::BitOr, std::move(lhs), parseBitXor());
+  }
+  return lhs;
+}
+
+ExprPtr Parser::parseBitXor() {
+  ExprPtr lhs = parseBitAnd();
+  while (at(TokenKind::Caret)) {
+    SourceLocation loc = advance().loc;
+    lhs = std::make_unique<BinaryExpr>(loc, BinaryOp::BitXor, std::move(lhs), parseBitAnd());
+  }
+  return lhs;
+}
+
+ExprPtr Parser::parseBitAnd() {
+  ExprPtr lhs = parseEquality();
+  while (at(TokenKind::Amp)) {
+    SourceLocation loc = advance().loc;
+    lhs = std::make_unique<BinaryExpr>(loc, BinaryOp::BitAnd, std::move(lhs), parseEquality());
   }
   return lhs;
 }
@@ -800,7 +1133,7 @@ ExprPtr Parser::parseEquality() {
 }
 
 ExprPtr Parser::parseComparison() {
-  ExprPtr lhs = parseAdditive();
+  ExprPtr lhs = parseShift();
   for (;;) {
     BinaryOp op;
     if (at(TokenKind::Less))
@@ -811,6 +1144,21 @@ ExprPtr Parser::parseComparison() {
       op = BinaryOp::Gt;
     else if (at(TokenKind::GreaterEq))
       op = BinaryOp::Ge;
+    else
+      return lhs;
+    SourceLocation loc = advance().loc;
+    lhs = std::make_unique<BinaryExpr>(loc, op, std::move(lhs), parseShift());
+  }
+}
+
+ExprPtr Parser::parseShift() {
+  ExprPtr lhs = parseAdditive();
+  for (;;) {
+    BinaryOp op;
+    if (at(TokenKind::ShiftL))
+      op = BinaryOp::Shl;
+    else if (at(TokenKind::ShiftR))
+      op = BinaryOp::Shr;
     else
       return lhs;
     SourceLocation loc = advance().loc;
@@ -860,12 +1208,21 @@ ExprPtr Parser::parseInterval() {
 }
 
 ExprPtr Parser::parseIntervalMeet() {
-  ExprPtr lhs = parseUnary();
+  ExprPtr lhs = parseCast();
   while (at(TokenKind::Meet)) {
     SourceLocation loc = advance().loc;
-    lhs = std::make_unique<BinaryExpr>(loc, BinaryOp::Meet, std::move(lhs), parseUnary());
+    lhs = std::make_unique<BinaryExpr>(loc, BinaryOp::Meet, std::move(lhs), parseCast());
   }
   return lhs;
+}
+
+ExprPtr Parser::parseCast() {
+  ExprPtr e = parseUnary();
+  while (accept(TokenKind::KwAs)) {
+    TypeExprPtr ty = parseType();
+    e = std::make_unique<CastExpr>(e->loc, std::move(e), std::move(ty));
+  }
+  return e;
 }
 
 ExprPtr Parser::parseUnary() {
@@ -881,6 +1238,11 @@ ExprPtr Parser::parseUnary() {
   if (tok.kind == TokenKind::Tilde) {
     advance();
     return std::make_unique<UnaryExpr>(tok.loc, UnaryOp::IntervalRev, parseUnary());
+  }
+  if (tok.kind == TokenKind::Amp) {
+    advance();
+    bool mut = accept(TokenKind::KwMut);
+    return std::make_unique<BorrowExpr>(tok.loc, mut, parseUnary());
   }
   // Path abstraction `<i> body`.
   if (tok.kind == TokenKind::Less && peek(1).kind == TokenKind::Identifier &&
@@ -937,13 +1299,21 @@ ExprPtr Parser::parsePostfix() {
         call->effectInst = bits;
         e = std::move(call);
       } else {
-        TypeExprPtr arg = parseType();
+        std::vector<TypeExprPtr> targs;
+        do {
+          targs.push_back(parseType());
+        } while (accept(TokenKind::Comma));
         expect(TokenKind::RBracket, "to close type instantiation");
         auto call = std::make_unique<CallExpr>(loc, std::move(e), parseArgs());
         call->hasTypeArg = true;
-        call->typeArg = std::move(arg);
+        call->typeArgs = std::move(targs);
+        if (!call->typeArgs.empty())
+          call->typeArg = call->typeArgs.front()->clone();
         e = std::move(call);
       }
+    } else if (at(TokenKind::Question)) {
+      SourceLocation loc = advance().loc;
+      e = std::make_unique<TryExpr>(loc, std::move(e));
     } else if (at(TokenKind::KwAlong)) {
       if (!e || e->kind != ExprKind::Call)
         fail(peek(), "'along' follows a cofn self-call");

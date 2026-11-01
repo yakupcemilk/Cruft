@@ -1,0 +1,20 @@
+package demo
+
+pub fn main(): i32
+    var s: i64 = 0
+    for i in 0 .. 5 do
+        if i == 3 then
+            break
+        end
+        s = s + i
+    end
+    var xs: Vector(i32) = []
+    xs.push(1)
+    xs.push(4)
+    xs.at(0) = 9
+    print(s)
+    print(xs.length())
+    print(xs.at(0))
+    print(xs.pop())
+    ret 0
+end

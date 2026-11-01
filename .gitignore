@@ -15,3 +15,5 @@ cmake_install.cmake
 CTestTestfile.cmake
 Testing/
 test-out/
+cruft_language_reference.md
+cruft_phase_d.txt

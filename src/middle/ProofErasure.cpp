@@ -47,6 +47,31 @@ void ProofErasure::substBlock(Block &block, const sema::Symbol *var, const Expr 
       substBlock(w.body, var, with, norm);
       break;
     }
+    case StmtKind::For: {
+      auto &f = static_cast<ForStmt &>(*stmt);
+      substExpr(f.low, var, with, norm);
+      substExpr(f.high, var, with, norm);
+      substExpr(f.iter, var, with, norm);
+      substExpr(f.step, var, with, norm);
+      substBlock(f.body, var, with, norm);
+      break;
+    }
+    case StmtKind::FieldAssign: {
+      auto &a = static_cast<FieldAssignStmt &>(*stmt);
+      substExpr(a.place, var, with, norm);
+      substExpr(a.value, var, with, norm);
+      break;
+    }
+    case StmtKind::IndexAssign: {
+      auto &ix = static_cast<IndexAssignStmt &>(*stmt);
+      substExpr(ix.place, var, with, norm);
+      substExpr(ix.index, var, with, norm);
+      substExpr(ix.value, var, with, norm);
+      break;
+    }
+    case StmtKind::Break:
+    case StmtKind::Continue:
+      break;
     case StmtKind::Foreach:
       substBlock(static_cast<ForeachStmt &>(*stmt).body, var, with, norm);
       break;
@@ -55,6 +80,9 @@ void ProofErasure::substBlock(Block &block, const sema::Symbol *var, const Expr 
       break;
     case StmtKind::ScopeArena:
       substBlock(static_cast<ScopeArenaStmt &>(*stmt).body, var, with, norm);
+      break;
+    case StmtKind::Unsafe:
+      substBlock(static_cast<UnsafeStmt &>(*stmt).body, var, with, norm);
       break;
     case StmtKind::Error:
       break;
@@ -135,6 +163,35 @@ void ProofErasure::eraseBlock(Block &block, sema::Normalizer &norm) {
       kept.push_back(std::move(stmt));
       break;
     }
+    case StmtKind::For: {
+      auto &f = static_cast<ForStmt &>(*stmt);
+      eraseExpr(f.low, norm);
+      eraseExpr(f.high, norm);
+      eraseExpr(f.iter, norm);
+      eraseExpr(f.step, norm);
+      eraseBlock(f.body, norm);
+      kept.push_back(std::move(stmt));
+      break;
+    }
+    case StmtKind::FieldAssign: {
+      auto &a = static_cast<FieldAssignStmt &>(*stmt);
+      eraseExpr(a.place, norm);
+      eraseExpr(a.value, norm);
+      kept.push_back(std::move(stmt));
+      break;
+    }
+    case StmtKind::IndexAssign: {
+      auto &ix = static_cast<IndexAssignStmt &>(*stmt);
+      eraseExpr(ix.place, norm);
+      eraseExpr(ix.index, norm);
+      eraseExpr(ix.value, norm);
+      kept.push_back(std::move(stmt));
+      break;
+    }
+    case StmtKind::Break:
+    case StmtKind::Continue:
+      kept.push_back(std::move(stmt));
+      break;
     case StmtKind::Foreach: {
       auto &f = static_cast<ForeachStmt &>(*stmt);
       if (f.binder) {
@@ -150,6 +207,12 @@ void ProofErasure::eraseBlock(Block &block, sema::Normalizer &norm) {
     case StmtKind::ScopeArena: {
       auto &a = static_cast<ScopeArenaStmt &>(*stmt);
       eraseBlock(a.body, norm);
+      kept.push_back(std::move(stmt));
+      break;
+    }
+    case StmtKind::Unsafe: {
+      auto &u = static_cast<UnsafeStmt &>(*stmt);
+      eraseBlock(u.body, norm);
       kept.push_back(std::move(stmt));
       break;
     }
@@ -229,6 +292,15 @@ void ProofErasure::eraseExpr(ExprPtr &expr, sema::Normalizer &norm) {
     eraseExpr(static_cast<UnaryExpr &>(*expr).operand, norm);
     break;
   }
+  case ExprKind::Cast:
+    eraseExpr(static_cast<CastExpr &>(*expr).operand, norm);
+    break;
+  case ExprKind::Borrow:
+    eraseExpr(static_cast<BorrowExpr &>(*expr).place, norm);
+    break;
+  case ExprKind::Try:
+    eraseExpr(static_cast<TryExpr &>(*expr).operand, norm);
+    break;
   case ExprKind::PathAbs:
     eraseExpr(static_cast<PathAbsExpr &>(*expr).body, norm);
     break;
